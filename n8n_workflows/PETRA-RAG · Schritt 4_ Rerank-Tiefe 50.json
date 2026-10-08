@@ -1,0 +1,2379 @@
+{
+  "name": "PETRA-RAG · Schritt 4: Rerank-Tiefe 50",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "petra-query",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "0a7adf99-c74a-4d5a-a90c-c173359ff7c5",
+      "name": "Webhook: /petra-query",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -5280,
+        1056
+      ],
+      "webhookId": "d1fb268a-8b73-4e2f-b781-86a56da3e09f"
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 0 | Architekturbezug: Kap. 4.2 Eingang\n// Normalisiert den Request, startet die Latenzmessung (Kap. 4.2 [5c])\n// und validiert die Eingabe.\n//\n// NEU ggü. v2: Laengenbegrenzung. Die Anfrage fliesst in bis zu vier\n// LLM-Prompts; eine unbegrenzte Eingabe ist sowohl ein Kontextfenster-\n// Risiko (Kap. 4.6.1) als auch eine Prompt-Injection-Flaeche gegen die\n// Anti-Halluzinations-Direktive.\nconst body = $json.body || $json;\nconst raw = (body.query || '').toString().trim();\n\n// NF-08 Mehrsprachigkeit (\"Antwortsprache = Anfragesprache in 100 % der\n// Faelle\") und UC-01 A5 (nicht unterstuetzte Sprache -> Meldung).\n// Regelbasiert statt per LLM: Die Detektion sitzt VOR der Klassifikation\n// im kritischen Pfad; ein zusaetzlicher LLM-Aufruf kostete ~1 s und\n// damit ein Fuenftel des NF-03-Budgets. Portiert aus\n// petra_hybrid/language.py::detect_language.\nfunction detectLanguage(text) {\n  const t = (text || '').trim();\n  if (!t) return { language: 'Deutsch', supported: true, reason: 'Leere Anfrage.' };\n  const nonLatin = (t.match(/[Ѐ-ӿ֐-׿؀-ۿͰ-Ͽ一-鿿぀-ヿ]/g) || []).length;\n  if (nonLatin >= 3 && nonLatin / t.length > 0.15) {\n    return { language: 'unbekannt', supported: false, reason: 'Nicht-lateinische Schrift erkannt.' };\n  }\n  const DE = ['welche','welcher','welches','wie','was','ist','hat','der','die','das','und','oder','für','mit','von','kostet','vergleiche','unterschied','eignet','sich','bei','kann','nicht','ein','eine','einen','zwischen'];\n  const EN = ['which','what','how','is','are','has','have','the','and','or','for','with','of','cost','costs','compare','difference','between','suitable','can','not','a','an','does','do','price'];\n  const tokens = (t.toLowerCase().match(/[a-zA-ZäöüßÄÖÜ]+/g) || []);\n  let de = tokens.filter(x => DE.includes(x)).length;\n  const en = tokens.filter(x => EN.includes(x)).length;\n  if (/[äöüßÄÖÜ]/.test(t)) de += 2;\n  if (de + en === 0) return { language: 'Deutsch', supported: true, reason: 'Keine Sprachmarker; Standardsprache.' };\n  return de >= en\n    ? { language: 'Deutsch', supported: true, reason: `${de} DE vs ${en} EN Marker.` }\n    : { language: 'Englisch', supported: true, reason: `${en} EN vs ${de} DE Marker.` };\n}\n\nif (!raw) {\n  return [{ json: {\n    __input_invalid: true,\n    error: 'Leere Anfrage. Feld \"query\" ist erforderlich.',\n    start_ts: Date.now()\n  }}];\n}\n\nreturn [{\n  json: {\n    query: raw.slice(0, 1000),\n    query_truncated: raw.length > 1000,\n    language: body.language || detectLanguage(raw).language,\n    language_supported: detectLanguage(raw).supported,\n    language_reason: detectLanguage(raw).reason,\n    top_k: Math.min(Math.max(parseInt(body.top_k) || 5, 1), 10),\n    score_threshold: typeof body.score_threshold === 'number' ? body.score_threshold : parseFloat($env.PETRA_CRAG_THRESHOLD || '0.65'),\n    request_id: body.request_id\n      || ($json.headers && $json.headers['x-request-id'])\n      || (Date.now() + '-' + Math.random().toString(36).slice(2)),\n    retrieval_round: 1,\n    activated_paths: [],\n    start_ts: Date.now()\n  }\n}];"
+      },
+      "id": "15b1387a-70cc-4d8a-84ae-faabca65b421",
+      "name": "Input normalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5056,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.__input_invalid }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56f423de-05b0-4b62-81a9-b19397995465",
+      "name": "IF: Eingabe gueltig?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -4832,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: {\n  answer: 'Die Anfrage konnte nicht verarbeitet werden.',\n  context_sufficient: false,\n  sources: [],\n  retrieved_documents: 0,\n  verified: false,\n  fallback_reason: $json.error || 'Ungueltige Eingabe.',\n  latency_ms: Date.now() - ($json.start_ts || Date.now())\n}}];"
+      },
+      "id": "f64c9885-0f74-4055-a31a-dff2f8f6b1a3",
+      "name": "Fehlerantwort: ungueltige Eingabe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4384,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "ebec4ff8-1e5e-4a26-a47c-d466175e89aa",
+      "name": "Respond: Eingabefehler",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        -4160,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.language_supported }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "969886cc-f40a-4ec6-ae3b-644f1c941f0e",
+      "name": "IF: Sprache unterstuetzt?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -4608,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// UC-01 A5: \"Anfrage in nicht unterstuetzter Sprache -> System\n// versucht automatische Erkennung; bei Misserfolg: Fehlermeldung.\"\n// NF-08 begrenzt den Support auf Deutsch und Englisch.\n//\n// Es wird bewusst KEIN Uebersetzungsversuch unternommen: Das\n// Embedding-Modell deckt nur DE/EN zuverlaessig ab (Kap. 4.6.1,\n// Mehrsprachigkeits-Grenze). Eine uebersetzte Anfrage wuerde ein\n// Retrieval-Ergebnis liefern, dessen Qualitaet niemand beurteilen kann —\n// eine ehrliche Meldung ist die belastbarere Antwort.\nreturn [{ json: {\n  answer: 'Diese Anfrage scheint in einer nicht unterstuetzten Sprache verfasst zu sein. Das System beantwortet Anfragen auf Deutsch und Englisch. Bitte formulieren Sie die Frage in einer dieser Sprachen.',\n  query_class: 'nicht_unterstuetzte_sprache',\n  context_sufficient: false,\n  sources: [],\n  retrieved_documents: 0,\n  verified: false,\n  fallback_reason: $json.language_reason || 'Sprache nicht unterstuetzt (NF-08).',\n  latency_ms: Date.now() - ($json.start_ts || Date.now()),\n  request_id: $json.request_id\n}}];"
+      },
+      "id": "a53f9e00-2279-4f47-9223-56dc044b0d0d",
+      "name": "Fehlerantwort: Sprache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4384,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/cache/lookup",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query, kind: \"response\" }) }}",
+        "options": {
+          "timeout": 1500
+        }
+      },
+      "id": "866cf0ab-6116-45c7-a36d-43a1ee02b162",
+      "name": "CAG Cache-Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -4384,
+        864
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [1c] / Kap. 3.2.1 Prinzip 4. Cache-Hit ueberspringt die gesamte Pipeline. onError=continue: Ein Cache-Ausfall darf nie eine Anfrage verhindern - der Cache beschleunigt, er ist nicht funktionskritisch."
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 1c | Kap. 4.2 [1c]\n// Vereinheitlicht das Ergebnis des Cache-Lookups und stellt den\n// Anfragekontext wieder her (der HTTP-Node verliert ihn).\nconst ctx = $('Input normalisieren').last().json;\nconst res = $json || {};\nconst hit = res.cache_hit === true && res.payload;\n\nreturn [{ json: {\n  ...ctx,\n  cache_hit: !!hit,\n  cache_age_seconds: res.cache_age_seconds || 0,\n  cached_payload: hit ? res.payload : null\n}}];"
+      },
+      "id": "4feb65ab-442c-4b56-a6d1-954678eb21ce",
+      "name": "Cache-Ergebnis auswerten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4160,
+        864
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.cache_hit }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f3e67bd7-21e9-42f7-967c-7fd70749339c",
+      "name": "IF: Cache-Hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -3936,
+        864
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 3.1.1: CAG ist eine reine Latenzschicht - die Antwort ist\n// inhaltlich identisch zur regulaeren Pipeline. Kennzeichnung als\n// Cache-Antwort bleibt aber erhalten (P6 Erklaerbarkeit): Der Nutzer\n// muss erkennen koennen, dass die Antwort nicht neu erzeugt wurde.\nconst payload = $json.cached_payload || {};\nreturn [{ json: {\n  ...payload,\n  cache_hit: true,\n  cache_age_seconds: $json.cache_age_seconds,\n  latency_ms: Date.now() - ($json.start_ts || Date.now()),\n  request_id: $json.request_id\n}}];"
+      },
+      "id": "2627162e-4782-40cc-ad0e-e33e3f1578b6",
+      "name": "Cache-Antwort aufbereiten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3712,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "9fa7bd33-00e0-4ab3-95a5-42f5a16d75af",
+      "name": "Respond: Cache-Treffer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        -3488,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 1 | Kap. 4.2 [1], Kap. 4.3 [1]\n//\n// SINGLE SOURCE OF TRUTH fuer das Routing. Portiert aus\n// petra_hybrid/classification.py::ROUTING_MATRIX. In v2 lag dieses\n// Wissen an drei Stellen (Classifier-Kategorien, fuenf Set-Nodes,\n// Switch-Regeln) und lief bei der Restklasse auseinander - die Anfrage\n// landete in einem Dead End (Review P-01).\n//\n// NEU - KLASSIFIKATIONSKORREKTUR (Evaluation 17.08.2026):\n// Der Testlauf ueber die 50 Weidmueller-Testfaelle ergab eine\n// Dokument-Trefferquote von nur 32 %. Die Auswertung nach Fragetyp\n// zeigte kein Muster; auffaellig war stattdessen, dass die Klasse bei\n// Produktfragen mit Klartextnamen (\"Wie hoch ist der Nennstrom der\n// WDU 2.5?\") systematisch auf 'allgemeine_technische_frage' fiel,\n// obwohl die Produktextraktion den Code korrekt erkannte\n// (candidate_products: [\"WDU 2.5\"]).\n//\n// Die Folge war dreifach:\n//   - tag:false            -> der TAG-Pfad blieb ungenutzt\n//   - hyde:true            -> ein unnoetiger LLM-Aufruf\n//   - CLASS_HINT Q5        -> \"begrifflich/konzeptuell, ohne\n//                             Produktempfehlung\" im Prompt, also genau\n//                             die falsche Anweisung fuer eine\n//                             Attributabfrage\n//\n// Die Korrektur unten ist regelbasiert und damit deterministisch: Wer\n// einen Produktcode nennt, stellt keine Restklassen-Frage. Dieselbe\n// Logik nutzt der Workflow bereits im heuristischen Fallback des\n// Text Classifiers; sie wird hier nur konsequent auch auf das\n// LLM-Ergebnis angewendet.\n\nconst ROUTING = {\n  produktspezifikation:       { q_class:'Q1', dense:true, bm25:true, tag:true,  hyde:false, agentic:false },\n  produktvergleich:           { q_class:'Q2', dense:true, bm25:true, tag:true,  hyde:false, agentic:false, dual_retrieval:true },\n  produktsuche:               { q_class:'Q3', dense:true, bm25:true, tag:false, hyde:true,  agentic:false },\n  preisanfrage:               { q_class:'Q4', dense:true, bm25:true, tag:false, hyde:false, agentic:true  },\n  allgemeine_technische_frage:{ q_class:'Q5', dense:true, bm25:true, tag:false, hyde:true,  agentic:false, fallback:true }\n};\nconst FALLBACK = 'allgemeine_technische_frage';\n\nconst raw = $json.query_class;\nconst known = Object.prototype.hasOwnProperty.call(ROUTING, raw);\n\n// `let` statt `const`: Die Klasse kann unten durch die\n// Produktcode-Erkennung noch korrigiert werden.\nlet klasse = known ? raw : FALLBACK;\n\n// --- Produktcode-Erkennung (Kap. 4.1.1, Review P-12) ---------------\n// Whitelist realer Formate statt generischer Heuristik. Das alte Muster\n// verlangte einen Buchstabenpraefix und verfehlte reine Artikelnummern\n// wie 2903590000; gleichzeitig matchte es IP67/ATEX/DIN als Produkte.\n// NEU (2026-09-13): Bindestrich-Kompositum-Muster ergaenzt. Fund:\n// \"HDC-KIT-HA 10.110\" und \"UR20-FBC-PN-IRT-V2\" (haeufige Weidmueller-\n// Bauform bei Steckverbindern/Kopplern) wurden von den bisherigen vier\n// Mustern nur fragmentarisch erkannt (\"HA 10\" bzw. \"UR20\") - die fuer\n// die Unterscheidung von Geschwister-Varianten entscheidende Endung\n// ging verloren. Folge: Retrieval/Priorisierung konnte\n// \"UR20-FBC-PN-IRT-V2\" nicht von \"UR20-FBC-EIP\" unterscheiden\n// (Testfaelle 34, 36, 58, 59 - falsches Geschwisterprodukt geliefert).\n// Das neue Muster erfasst den GESAMTEN Bindestrich-/Leerzeichen-Code ab\n// einem Buchstaben-Anker, inkl. Ziffern und Punkten in den Segmenten.\n// ERWEITERT (2026-09-13): Zeichenklasse um +, / und Komma ergaenzt.\n// Fund: Weidmueller-Codes fuer Ueberspannungsschutz/Leiterplattenklemmen\n// nutzen diese Zeichen INNERHALB des Codes als Bedeutungstraeger (z.B.\n// \"3+1\" = Polkonfiguration, \"300/12,5\" = Ratingpaar). Die vorherige\n// Version brach genau an diesen Zeichen ab (Testfaelle 25, 26, 51, 52)\n// und verlor damit exakt den Teil, der Geschwistervarianten unterscheidet.\nconst PATTERNS = [\n  /\\b\\d{10}\\b/g,                              // reine Artikelnummer\n  /\\b[A-Z]{1,3}\\d[A-Z]?\\d{2,5}[A-Z]?\\b/g,     // z.B. O1D302, A2C 4\n  /\\b[A-Z]{2,4}\\s?\\d{2,6}[A-Z]?\\b/g,          // z.B. BOS 0035, TRS 24\n  /\\b[A-Z]{2,4}\\s?\\d{1,2}\\.\\d{1,2}\\b/g,        // z.B. WDU 2.5, A2C 2.5\n  /\\b[A-Z]{2,4}\\s?\\d{1,2}[A-Z]?\\/\\d{1,3}\\b/g,  // z.B. ZQV 4N/10, WQV 4/2\n  /\\b[A-Z][A-Z0-9]{1,6}(?:[-\\s][A-Z0-9.,+\\/]+){1,8}\\b/g    // NEU: HDC-KIT-HA 10.110, UR20-FBC-PN-IRT-V2\n];\n\n// Normbezeichnungen und Schnittstellen, die wie Produktcodes aussehen,\n// aber keine sind. Ohne diese Liste wuerde \"IP67\" oder \"M12\" eine\n// Produktfilterung ausloesen, die ins Leere laeuft.\nconst NON_PRODUCT = ['IP','ATEX','DIN','EN','ISO','IEC','SIL','NEMA','UL','VDE','PL','IO','USB','RS','DC','AC','PNP','NPN','M12','M8'];\nconst NON_PRODUCT_EXACT = ['IO-LINK','IOLINK','PROFINET','ETHERCAT','MODBUS'];\n\nconst q = $json.query || '';\nconst found = [];\nfor (const re of PATTERNS) {\n  for (const m of (q.match(re) || [])) {\n    const token = m.trim();\n    const upper = token.toUpperCase().replace(/\\s/g, '');\n    if (NON_PRODUCT_EXACT.includes(upper)) continue;\n    const letters = upper.replace(/[^A-Z]/g, '');\n    if (letters && NON_PRODUCT.includes(letters)) continue;\n    if (!/\\d/.test(upper)) continue;\n    found.push(token);\n  }\n}\nconst unique = [...new Set(found)];\n\n// Fragment-Bereinigung: entfernt Kandidaten, die Teilstring eines\n// LAENGEREN Kandidaten sind.\nconst norm = s => s.toUpperCase().replace(/\\s/g, '');\nconst candidate_products = unique.filter(p =>\n  !unique.some(other => other !== p && norm(other).includes(norm(p)) && norm(other).length > norm(p).length)\n);\n\n// Korrektur nach ANZAHL erkannter Produkte, unabhaengig davon, was der\n// Text Classifier selbst geraten hat. Fund 13.09.2026: Der Classifier\n// riet bei einer eindeutigen Einzelprodukt-Frage (\"Klippon POK 080806\")\n// und bei einer reinen Produktsuch-Frage (\"Ich brauche eine...\") jeweils\n// direkt \"produktvergleich\" - eine Korrektur, die nur bei der Restklasse\n// ansetzt, laesst solche direkten Classifier-Fehlgriffe unkorrigiert.\nconst SUCH_WOERTER = ['brauche', 'suche', 'empfehl', 'geeignet für', 'geeignet fuer', 'welches produkt'];\nconst klasse_vor_korrektur = klasse;\nif (klasse !== 'preisanfrage') {\n  if (candidate_products.length >= 2) {\n    klasse = 'produktvergleich';\n  } else if (candidate_products.length === 1) {\n    klasse = 'produktspezifikation';\n  } else if (SUCH_WOERTER.some(w => q.toLowerCase().includes(w))) {\n    klasse = 'produktsuche';\n  }\n  // 0 Kandidaten, kein Suchwort: Classifier-Entscheidung unveraendert.\n}\n\nconst r = ROUTING[klasse];\n\n// --- Aktivierte Retrieval-Pfade ------------------------------------\nconst paths = [];\nif (r.dense) paths.push('dense');\nif (r.bm25) paths.push('bm25');\nif (r.tag) paths.push('tag');\nif (r.agentic) paths.push('agentic');\nif (r.hyde) paths.push('hyde_eligible');\n\nreturn [{ json: { ...$json,\n  query_class: klasse,\n  q_class: r.q_class,\n  routing_fallback_applied: !known,\n  // Nachvollziehbarkeit (P6): In der Telemetrie sichtbar, wie oft die\n  // Korrektur greift. Ein hoher Wert ist ein Hinweis darauf, dass die\n  // Kategorienbeschreibung des Text Classifiers nachgeschaerft werden\n  // sollte - die Korrektur behandelt das Symptom, nicht die Ursache.\n  klasse_korrigiert: klasse !== klasse_vor_korrektur,\n  klasse_vor_korrektur,\n  tag_index_aktiv: !!r.tag,\n  hyde_eligible: !!r.hyde,\n  agentic_pfad: !!r.agentic,\n  dual_retrieval: !!r.dual_retrieval && candidate_products.length >= 2,\n  candidate_products,\n  activated_paths: paths\n}}];"
+      },
+      "id": "5b2d1de1-16df-4abe-87cc-1db796f2530d",
+      "name": "Routing & Produktextraktion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2688,
+        1008
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 2 Einstieg | Kap. 4.2 Schicht 2\n//\n// EINZIGER Einstiegspunkt ins Retrieval. Runde 1 kommt von\n// 'Routing & Produktextraktion', Runde 2 von 'Runde 2 vorbereiten'.\n// Hier werden die Query-Varianten gebaut: Jeder Retriever bekommt die\n// Textform, die zu seinem Suchverfahren passt.\n//\n// HARTER LOOP-GUARD (Review P-06): In v2 wurde retrieval_round aus\n// einer Node-Referenz rekonstruiert und dabei auf 1 zurueckgesetzt -\n// eine potentiell endlose Rewrite-Schleife, die pro Zyklus einen\n// LLM-Call und damit die GPU belegte. Der Zaehler wird jetzt\n// durchgereicht und hier hart begrenzt.\nconst round = Math.min(parseInt($json.retrieval_round) || 1, 2);\nconst original = ($json.query_original || $json.query || '').trim();\nconst rewritten = ($json.query_rewritten || '').trim();\nconst hyde = ($json.hyde_document || '').trim();\nconst codes = $json.candidate_products || [];\n\n// BM25 (lexikalisch): IMMER die unveraenderte Anfrage plus erkannte\n// Produktcodes zur Gewichtsverstaerkung. KEIN Rewriting - Synonyme\n// zerstoeren den exakten Code-Match, der die Staerke von BM25 ist\n// (Kap. 4.5.1, Achse 1). Produktcodes werden ANGEHAENGT, nicht\n// ersetzt (Review P-11): Sonst geht der Attributbegriff verloren und\n// BM25 liefert irgendeinen Chunk des Produkts statt des richtigen.\n//const query_sparse = [original, \"Klemme\", \"Reihenklemme\", ...codes].join(' ').trim();\n\n// Die pauschale Term-Injektion verfaelscht BM25 bei Nicht-Klemmen-Produkten\n// (Fall 17 Netzteil, 40 Switch, 22 Ableiter). Nur bei erkannter\n// Klemmen-Produktfamilie anhaengen.\nconst KLEMMEN_PREFIX = /^(WDU|WDK|ZDU|IDU|A2C|ADT|WAP|WEW|WQV|ZQV)/i;\nconst istKlemme = codes.some(c => KLEMMEN_PREFIX.test(c));\nconst query_sparse = [original, ...(istKlemme ? ['Reihenklemme'] : []), ...codes]\n  .join(' ').trim();\n\n// Dense (semantisch): HyDE-Dokument > Rewrite > Original.\n// Kap. 4.3 [1a]: Das hypothetische Snippet ERSETZT die Anfrage als\n// Embedding-Basis.\nconst query_dense = hyde || rewritten || original;\n\n// TAG (serialisierte Tabellenzeilen): Produktcodes + Attributbegriffe\n// statt Fragesatz - Tabellenzeilen enthalten keine Fragen.\nconst query_tag = codes.length\n  ? [...codes, 'Technische Daten Spezifikation'].join(' ')\n  : original;\n\nreturn [{ json: { ...$json,\n  query: original,\n  query_original: original,\n  query_rewritten: rewritten || null,\n  hyde_document: hyde || null,\n  query_sparse,\n  query_dense,\n  query_tag,\n  retrieval_round: round\n}}];"
+      },
+      "id": "4701d6a2-d01c-4d6b-a037-b9f64b411ec3",
+      "name": "Retrieval-Start",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2464,
+        1008
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.hyde_eligible && ($env.PETRA_HYDE_ENABLED || 'true') === 'true' && $json.retrieval_round === 1 }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4c669c5e-1df7-4118-9294-b109f1bee398",
+      "name": "IF: HyDE aktiv?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -2240,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0.3,
+          "keepAlive": "30m",
+          "numCtx": 8192
+        }
+      },
+      "id": "f200ddcf-a232-4fd7-bbd8-0b25c0f06474",
+      "name": "Ollama Chat Model (HyDE)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        -1936,
+        880
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Erstelle auf Basis der folgenden Frage einen kurzen, sachlichen Absatz im Stil eines technischen Produktdatenblatts.\n\nRegeln:\n- Maximal 3 Sätze.\n- Beantworte die Frage direkt und fachlich präzise.\n- Verwende technische Fachterminologie und nur passende, etablierte Normbezeichnungen.\n- Bleibe auf Ebene der Produktkategorie; keine konkreten Hersteller, Produktnamen oder Modelle.\n- Erfinde keine Messwerte, Kennzahlen, Leistungsdaten oder sonstigen konkreten technischen Angaben.\n- Wenn konkrete Angaben fehlen, formuliere allgemein statt Werte oder Spezifikationen zu ergänzen.\n- Keine Werbung, Bewertungen oder unbelegten Qualitätsaussagen.\n- Keine Einleitung, Überschrift, Aufzählung oder Quellenangabe.\n- Ausgabe ausschließlich als ein zusammenhängender Absatz.\n\nFrage:\n{{ $json.query_original }}"
+      },
+      "id": "ff9e4125-2617-455f-83be-028a8a0eab77",
+      "name": "HyDE Query-Expansion (LLM Chain)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        -2016,
+        656
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [1a] / Kap. 4.3 [1a]. Ueberbrueckt die Vokabular-Luecke zwischen Alltagssprache ('Sensor fuer nasse Umgebung') und Fachsprache ('IP 69K, EN 60529'). Die Anweisung, KEINE konkreten Produktnamen zu erfinden, ist wesentlich: Ein halluzinierter Produktcode im Embedding-Input zieht das Dense-Retrieval gezielt auf ein nicht existierendes Produkt."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 4.3 [1a]: Das hypothetische Snippet ersetzt die Anfrage als\n// Embedding-Basis fuer Dense Retrieval. BM25 und TAG bleiben\n// unveraendert - fuer lexikalische Suche waere ein generierter Text\n// kontraproduktiv.\nconst ctx = $('Retrieval-Start').last().json;\nconst doc = ($json.text || $json.output || '').trim();\nreturn [{ json: { ...ctx,\n  hyde_document: doc || null,\n  query_dense: doc || ctx.query_dense,\n  activated_paths: [...(ctx.activated_paths || []), doc ? 'hyde_applied' : 'hyde_failed']\n}}];"
+      },
+      "id": "f8464d11-c45e-4c66-ac6e-a592d4b45ab1",
+      "name": "HyDE uebernehmen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1664,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.agentic_pfad }}",
+                    "rightValue": "={{ true }}",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Agentic (Q4)"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.tag_index_aktiv }}",
+                    "rightValue": "={{ true }}",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Hybrid + TAG (Q1/Q2)"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.query_class }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "string",
+                      "operation": "exists",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Hybrid ohne TAG (Q3/Q5)"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "2a747359-28a3-4ed5-b133-d0107d18f654",
+      "name": "Switch: Retrieval-Pfade",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -1440,
+        752
+      ],
+      "notes": "Kap. 4.2 [1]: Routing steuert die Aktivierung der Retrieval-Pfade funktional. Es wird auf ROUTING-FLAGS geprueft, nicht auf Klassennamen - so muss beim Hinzufuegen einer Klasse nur die ROUTING_MATRIX geaendert werden, nicht der Switch. Zusaetzlich fallbackOutput=extra: Kein Eingang kann mehr im Nichts enden (Review P-01)."
+    },
+    {
+      "parameters": {
+        "model": "bge-m3:latest"
+      },
+      "id": "2f061c14-75ad-4213-94fd-7f5c3c8afd42",
+      "name": "Ollama Embeddings",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+      "typeVersion": 1,
+      "position": [
+        -1136,
+        576
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      },
+      "notes": "KRITISCH (Review P-07): Dieses Modell MUSS mit dem der Ingestion identisch sein. Bei Abweichung liefert Dense-Retrieval bedeutungsloses Ranking - ohne Fehlermeldung, falls die Dimensionen zufaellig passen. Zentral ueber PETRA_EMBEDDING_MODEL gesetzt, damit Workflow und Ingestion nicht auseinanderlaufen koennen. Vor Inbetriebnahme mit GET /ops/health/deep pruefen."
+    },
+    {
+      "parameters": {
+        "mode": "load",
+        "chromaCollection": {
+          "__rl": true,
+          "value": "petra_text_chunks_v3",
+          "mode": "list",
+          "cachedResultName": "petra_text_chunks_v3"
+        },
+        "prompt": "={{ $json.query_dense }}",
+        "topK": 30,
+        "options": {}
+      },
+      "id": "23e132f4-2f5a-49c7-bcae-2756ea85ee9b",
+      "name": "Chroma Dense Retrieval",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreChromaDB",
+      "typeVersion": 1.3,
+      "position": [
+        -1216,
+        352
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 500,
+      "credentials": {
+        "chromaSelfHostedApi": {
+          "id": "JmxR1gjPYoFxM07u",
+          "name": "ChromaDB Self-Hosted account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [2b], Top-k=10. Der Filter schliesst Tabellen-Chunks aus, weil diese ueber den TAG-Index [2c] separat abgefragt werden - ohne ihn erscheinen sie doppelt und verzerren die RRF-Raenge. onError=continue: Faellt Dense aus, laeuft die Pipeline degradiert auf BM25 weiter statt komplett abzubrechen (Offline-First-Logik: teilweise verfuegbar schlaegt gar nicht verfuegbar)."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001'}}/retrieval/bm25",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.query_sparse }}"
+            },
+            {
+              "name": "top_k",
+              "value": "30"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "67f28d06-a879-4e96-b9f3-33943db89cc1",
+      "name": "BM25 Sparse Retrieval (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1152,
+        752
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "load",
+        "chromaCollection": {
+          "__rl": true,
+          "value": "petra_tag_chunks_v3",
+          "mode": "list",
+          "cachedResultName": "petra_tag_chunks_v3"
+        },
+        "prompt": "={{ $json.query_tag }}",
+        "topK": 10,
+        "options": {}
+      },
+      "id": "4a23aad7-8c6e-4f21-a535-92db3792e6f3",
+      "name": "Chroma TAG Tabellen-Index",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreChromaDB",
+      "typeVersion": 1.3,
+      "position": [
+        -1216,
+        1200
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 500,
+      "credentials": {
+        "chromaSelfHostedApi": {
+          "id": "JmxR1gjPYoFxM07u",
+          "name": "ChromaDB Self-Hosted account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [2c], nur Q1/Q2. ANGEGLICHEN an Phase-2b-Bericht §2 und README: gleiche Collection wie Dense, Trennung ueber den Metadatenfilter source_type=table. v2 nutzte eine separate Collection 'petra_tag_chunks' und wich damit von beiden Dokumenten ab. Eine Collection bedeutet ausserdem: ein Embedding-Modell, ein Konsistenzproblem weniger."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Vereinheitlicht das Ausgabeformat eines Retrieval-Pfads.\n//\n// KORREKTUR (Review P-02): v2 las `j.text || j.pageContent || j.document`.\n// Der Chroma-Node liefert im load-Modus aber {document:{pageContent,\n// metadata}, score} - `j.document` traf und lieferte ein OBJEKT statt\n// eines Strings. Folge: '[object Object]' im Prompt, leere Metadaten und\n// damit durchgaengig 'unbekannt' in der Quellenanzeige - ein Verstoss\n// gegen P6 (Erklaerbarkeit) im gesamten Dense-Pfad.\n// v3 deckt beide Verschachtelungen explizit ab und erzwingt Strings.\nconst SRC = 'dense';\nconst rows = [];\n\nfor (const [i, item] of $input.all().entries()) {\n  const j = item.json || {};\n  if (j.__skipped) continue;\n\n  // Chroma: {document:{pageContent,metadata},score} | BM25: {results:[...]}\n  const doc = (j.document && typeof j.document === 'object') ? j.document : j;\n  const meta = doc.metadata || j.metadata || j.meta || {};\n\n  let text = doc.pageContent ?? j.pageContent ?? j.text ?? '';\n  if (typeof text !== 'string') text = '';\n\n  // chunk_id MUSS quellenuebergreifend identisch sein, sonst kann RRF\n  // keine Raenge kombinieren (Review P-03). Faellt sie aus, wird ein\n  // INHALTS-Hash gebildet - eine quellenpraefixierte Ersatz-ID koennte\n  // per Konstruktion nie kollidieren und macht die Dedup wirkungslos.\n  let cid = j.chunk_id || j.id || meta.chunk_id;\n  if (!cid) {\n    const norm = text.trim().toLowerCase().replace(/\\s+/g, ' ');\n    let h = 0;\n    for (let k = 0; k < norm.length; k++) { h = ((h << 5) - h + norm.charCodeAt(k)) | 0; }\n    cid = (meta.source_type === 'table' ? 'tbl-' : 'txt-') + Math.abs(h).toString(16);\n  }\n\n  const score = typeof j.score === 'number' ? j.score\n    : (typeof j.similarity === 'number' ? j.similarity : null);\n\n  rows.push({ chunk_id: cid, text, metadata: meta, score, rank: rows.length + 1 });\n}\n\nreturn [{ json: { retrieval_source: SRC, results: rows, count: rows.length } }];"
+      },
+      "id": "a74fc281-8718-4781-8788-6dc247c2e0a7",
+      "name": "Dense-Treffer normalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        448
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Vereinheitlicht das Ausgabeformat eines Retrieval-Pfads.\n//\n// KORREKTUR (Review P-02): v2 las `j.text || j.pageContent || j.document`.\n// Der Chroma-Node liefert im load-Modus aber {document:{pageContent,\n// metadata}, score} - `j.document` traf und lieferte ein OBJEKT statt\n// eines Strings. Folge: '[object Object]' im Prompt, leere Metadaten und\n// damit durchgaengig 'unbekannt' in der Quellenanzeige - ein Verstoss\n// gegen P6 (Erklaerbarkeit) im gesamten Dense-Pfad.\n// v3 deckt beide Verschachtelungen explizit ab und erzwingt Strings.\nconst SRC = 'tag';\nconst rows = [];\n\nfor (const [i, item] of $input.all().entries()) {\n  const j = item.json || {};\n  if (j.__skipped) continue;\n\n  // Chroma: {document:{pageContent,metadata},score} | BM25: {results:[...]}\n  const doc = (j.document && typeof j.document === 'object') ? j.document : j;\n  const meta = doc.metadata || j.metadata || j.meta || {};\n\n  let text = doc.pageContent ?? j.pageContent ?? j.text ?? '';\n  if (typeof text !== 'string') text = '';\n\n  // chunk_id MUSS quellenuebergreifend identisch sein, sonst kann RRF\n  // keine Raenge kombinieren (Review P-03). Faellt sie aus, wird ein\n  // INHALTS-Hash gebildet - eine quellenpraefixierte Ersatz-ID koennte\n  // per Konstruktion nie kollidieren und macht die Dedup wirkungslos.\n  let cid = j.chunk_id || j.id || meta.chunk_id;\n  if (!cid) {\n    const norm = text.trim().toLowerCase().replace(/\\s+/g, ' ');\n    let h = 0;\n    for (let k = 0; k < norm.length; k++) { h = ((h << 5) - h + norm.charCodeAt(k)) | 0; }\n    cid = (meta.source_type === 'table' ? 'tbl-' : 'txt-') + Math.abs(h).toString(16);\n  }\n\n  const score = typeof j.score === 'number' ? j.score\n    : (typeof j.similarity === 'number' ? j.similarity : null);\n\n  rows.push({ chunk_id: cid, text, metadata: meta, score, rank: rows.length + 1 });\n}\n\nreturn [{ json: { retrieval_source: SRC, results: rows, count: rows.length } }];"
+      },
+      "id": "46c39bd8-8c13-4473-9cff-b2d2206f9c39",
+      "name": "TAG-Treffer normalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        1200
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// BM25-HTTP liefert genau ein Item: { results: [{chunk_id, text,\n// metadata, score, rank}, ...] }. Bei Ausfall (onError=continue am\n// HTTP-Node) fehlt `results` - dann wird eine leere, aber\n// wohlgeformte Liste erzeugt, damit RRF und Merge weiterlaufen.\nconst input = $input.first().json || {};\nconst hits = Array.isArray(input.results) ? input.results : [];\nconst degraded = !Array.isArray(input.results);\n\nconst normalized = hits.map((hit, index) => ({\n  chunk_id: hit.chunk_id ?? `txt-bm25-${index}`,\n  text: typeof hit.text === 'string' ? hit.text : '',\n  metadata: hit.metadata ?? {},\n  score: Number(hit.score ?? 0),\n  rank: Number(hit.rank ?? index + 1)\n}));\n\nreturn [{ json: {\n  retrieval_source: 'bm25',\n  results: normalized,\n  count: normalized.length,\n  degraded,\n  warning: input.warning || (degraded ? 'BM25-Dienst nicht erreichbar - Pipeline laeuft ohne Sparse-Pfad weiter.' : null)\n}}];"
+      },
+      "id": "a46b72a1-7918-4060-a9d1-36f6425f9aa7",
+      "name": "BM25-Treffer normalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        752
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "id": "b1e1f40c-b5c8-4095-b8d8-2c3ee3845923",
+      "name": "Merge Retrieval-Ergebnisse",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        -640,
+        832
+      ],
+      "alwaysOutputData": true,
+      "notes": "Kap. 4.2 Schicht 2 -> 3. Modus explizit auf 'append' gesetzt statt auf den Default zu vertrauen (Review P-15): Bei Q3/Q5 laeuft der TAG-Zweig nicht, Eingang 3 bleibt leer, und das Wartverhalten des Merge-Nodes ist versionsabhaengig."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fuehrt die 1-4 Merge-Items zu EINEM Item zusammen und stellt den\n// Anfragekontext wieder her (Chroma- und HTTP-Nodes verlieren ihn).\n// `.last()` statt `.first()` (Review P-06, CRAG-Runde 2).\n// s2 (Lexikon-Pfad): vierte Quelle 'product' + aufgeloeste Artikelnummern.\nconst ctx = $('Retrieval-Start').last().json;\nconst out = { dense_results: [], bm25_results: [], tag_results: [], product_results: [] };\nconst warnings = [];\nlet resolved = [], produktInfo = [], produktExakt = false;\n\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (!j.retrieval_source) continue;\n  out[j.retrieval_source + '_results'] = j.results || [];\n  if (j.warning) warnings.push(j.warning);\n  if (j.retrieval_source === 'product') {\n    resolved = j.resolved_artikelnummern || [];\n    produktInfo = j.produkt_info || [];\n    produktExakt = j.produkt_exakt === true;\n  }\n}\n\nconst total = out.dense_results.length + out.bm25_results.length\n  + out.tag_results.length + out.product_results.length;\nreturn [{ json: { ...ctx, ...out,\n  resolved_artikelnummern: resolved,\n  produkt_info: produktInfo,\n  produkt_exakt: produktExakt,\n  retrieval_warnings: warnings,\n  retrieval_total: total\n} }];"
+      },
+      "id": "35d7a1da-4bf7-435c-a000-47705f9ca33a",
+      "name": "Retrieval zusammenfassen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 3a | Kap. 4.2 [3a], Kap. 4.3 [3a]\n// RRF(d) = Sum_i 1/(k + rank_i(d)), k=50, Top-10. Portiert aus\n// petra_hybrid/rrf.py (Version 2).\n//\n// NEU ggü. v2:\n//  (1) bm25_normalized: Min-Max innerhalb der BM25-Liste. Der\n//      CRAG-Filter braucht einen quellenuebergreifend vergleichbaren\n//      Wert; der RRF-Score bleibt reines Ranking-Kriterium.\n//  (2) ID-Konsistenz-Guard: Kommt keine chunk_id in mehr als einer\n//      Quelle vor, kann RRF keine Raenge kombinieren und degeneriert\n//      still zu einer Konkatenation. Genau dieser Qualitaetsverlust\n//      war in v2 unsichtbar (Review P-03) - jetzt wird er gemessen und\n//      als Warnung mitgefuehrt.\n//\n// KORREKTUR DES GUARDS \n// ---------------------------------------------\n// Der Guard meldete in JEDER Anfrage 0 % und nannte als Ursache\n// abweichende chunk_ids zwischen BM25-Index und ChromaDB. Beides wurde\n// ueberprueft und trifft nicht zu:\n//\n//   (a) ID-Deckung: Eine gestreute Stichprobe des BM25-Index gegen\n//       beide Collections ergab 300/300 bzw. 233/233 Treffer — also\n//       100 % Deckung. Die IDs sind konsistent.\n//\n//   (b) Der Guard mass ueber ALLE drei Pfade das Maximum der\n//       paarweisen Ueberschneidungen. Dense liest aber\n//       petra_text_chunks, TAG liest petra_tag_chunks — zwei disjunkte\n//       Mengen. Eine Ueberschneidung ist dort per Konstruktion\n//       unmoeglich, nicht Ausdruck eines Fehlers.\n//\n// Gemessen wird deshalb nur noch zwischen Pfaden, die DENSELBEN Raum\n// durchsuchen. BM25 fuehrt Text- und Tabellen-Chunks in einem Index\n// (Stichprobe: 1943 text / 582 table) und ist damit die einzige\n// sinnvolle Vergleichsgroesse fuer Dense.\n//\n// Der Guard bleibt aussagekraeftig: Eine 0 bedeutet weiterhin, dass RRF\n// keine Raenge kombiniert. Nur die Ursache ist eine andere als die\n// urspruenglich vermutete — lexikalische und semantische Suche\n// reagieren bei strukturgleichen Datenblaettern auf unterschiedliche\n// Signale und finden verschiedene Dokumente.\n\nconst k = 50;\nconst topK = 50;   // s4: Rerank-Tiefe 50 (Akarsu et al. 2026)\n\nconst lists = {\n  dense: ($json.dense_results || []).map((r, i) => ({ ...r, rank: r.rank || i + 1 })),\n  bm25:  ($json.bm25_results  || []).map((r, i) => ({ ...r, rank: r.rank || i + 1 })),\n  tag:   ($json.tag_results   || []).map((r, i) => ({ ...r, rank: r.rank || i + 1 })),\n  product: ($json.product_results || []).map((r, i) => ({ ...r, rank: r.rank || i + 1 }))  // s2\n};\n\n// --- BM25-Normalisierung (siehe petra_hybrid/scoring.py) -----------\nconst bm25Norm = {};\nconst bmScores = lists.bm25.map(r => Number(r.score) || 0);\nif (bmScores.length) {\n  const top = Math.max(...bmScores);\n  const lo  = Math.min(...bmScores);\n  const span = (top - lo) || 1;\n  // Vertrauensdaempfung: Eine Liste aus lauter Zufallstreffern soll\n  // ihren besten Zufallstreffer nicht auf 1.0 heben.\n  const cap = Math.min(1, top / 6);\n  lists.bm25.forEach((r, i) => {\n    const rel = bmScores.length > 1 ? (bmScores[i] - lo) / span : 1;\n    bm25Norm[r.chunk_id] = Math.max(0, Math.min(1, rel * cap));\n  });\n}\n\n// --- Gewichtung der Quellen (70/30) ---\n// Unweighted RRF (Cormack et al. 2009). Bei Gewichtung UND null\n// Chunk-Ueberschneidung degeneriert die Formel zu einer Rangstrafe pro\n// Liste: BM25-Rang 1 (0.3/51 = 0.00588) lag unter Dense-Rang 10\n// (0.7/60 = 0.01167) — BM25 kam damit strukturell nie in die Top-10.\n// Belegt: der BM25-Index findet 1020000000 mit Score 13.8, der Chunk\n// erreichte den Prompt trotzdem nie (Faelle 10, 21, 43).\n// Die Qualitaetsauswahl trifft der Cross-Encoder, nicht die Fusion.\nconst denseWeight = 0.6;\nconst bm25Weight  = 0.4;\nconst tagWeight   = 0.7;\n\nconst rrf = {};\nconst byId = {};\nfor (const [source, items] of Object.entries(lists)) {\n  // Bestimme das Gewicht basierend auf der Quelle\n  let sourceWeight = 1;\n  if (source === 'dense') sourceWeight = denseWeight;\n  else if (source === 'bm25') sourceWeight = bm25Weight;\n  else if (source === 'tag') sourceWeight = tagWeight;\n  else if (source === 'product') sourceWeight = 1.0;   // s2 (Lexikon-Pfad)\n\n  for (const item of items) {\n    const cid = item.chunk_id;\n    if (!cid) continue;\n    // Gewichtete RRF-Formel\n    rrf[cid] = (rrf[cid] || 0) + sourceWeight * (1 / (k + item.rank));\n    \n    if (!byId[cid]) {\n      byId[cid] = { chunk_id: cid, text: item.text || '', metadata: item.metadata || {}, source_scores: {}, sources: [] };\n    }\n    byId[cid].source_scores[source] = item.score;\n    if (!byId[cid].sources.includes(source)) byId[cid].sources.push(source);\n    if (!byId[cid].text && item.text) byId[cid].text = item.text;\n    if (source === 'bm25' && bm25Norm[cid] !== undefined) {\n      byId[cid].bm25_normalized = Math.round(bm25Norm[cid] * 1e4) / 1e4;\n    }\n  }\n}\n\n// --- Konsistenz-Guard (korrigiert) ---------------------------------\n// Nur Dense gegen BM25: beide koennen dieselben Text-Chunks liefern.\n// TAG bleibt aussen vor, weil es eine andere Collection durchsucht.\nconst denseIds = new Set(lists.dense.map(r => r.chunk_id).filter(Boolean));\nconst bm25Ids  = new Set(lists.bm25.map(r => r.chunk_id).filter(Boolean));\n\nlet consistency = 1;      // 1 = nicht messbar (nur ein Pfad aktiv)\nlet messbar = false;\nif (denseIds.size && bm25Ids.size) {\n  messbar = true;\n  const inter = [...denseIds].filter(x => bm25Ids.has(x)).length;\n  const kleiner = Math.min(denseIds.size, bm25Ids.size) || 1;\n  consistency = Math.round((inter / kleiner) * 1e4) / 1e4;\n}\n\n// Zusaetzlich als Diagnosewert: Wie viele Dokumente teilen sich die\n// beiden Pfade? Eine Ueberschneidung auf Dokumentebene bei null\n// Ueberschneidung auf Chunkebene ist ein Hinweis auf zu feines oder\n// inhaltlich inkohaerentes Chunking — die Pfade finden dann dasselbe\n// Dokument, aber verschiedene Abschnitte daraus.\nfunction dokumente(items) {\n  return new Set(items\n    .map(r => (r.metadata || {}).filename || String(r.chunk_id || '').split('_p')[0])\n    .filter(Boolean));\n}\nconst denseDocs = dokumente(lists.dense);\nconst bm25Docs  = dokumente(lists.bm25);\nconst docOverlap = denseDocs.size && bm25Docs.size\n  ? [...denseDocs].filter(x => bm25Docs.has(x)).length\n  : 0;\n\nconst warnings = [...($json.retrieval_warnings || [])];\nif (messbar && consistency === 0) {\n  warnings.push(\n    `RRF-Ueberschneidung 0 %: Dense und BM25 liefern keine gemeinsamen `\n    + `chunk_ids; RRF reiht die Listen aneinander statt Raenge zu `\n    + `kombinieren. Gemeinsame Dokumente: ${docOverlap}. Die chunk_ids `\n    + `selbst sind konsistent (geprueft: 100 % Deckung BM25-Index gegen `\n    + `ChromaDB) — die Ursache liegt darin, dass lexikalische und `\n    + `semantische Suche bei strukturgleichen Datenblaettern auf `\n    + `unterschiedliche Signale reagieren.`\n  );\n}\n\n// --- RRF-Sortierung ---\nconst sorted = Object.keys(rrf)\n  .sort((a, b) => rrf[b] - rrf[a])\n  .map(cid => ({ ...byId[cid], rrf_score: Math.round(rrf[cid] * 1e6) / 1e6 }));\n\n// --- BM25-Mindestquote (5 Chunks) ---\n// Verhindert, dass BM25 bei 0 % Chunk-Überschneidung strukturell\n// aus dem Kandidatenfeld verschwindet.\nconst MIN_BM25 = 5;\nlet top = sorted.slice(0, topK);\n\n// Prüfen, ob bereits genug BM25-Chunks in den Top-K enthalten sind\nconst bm25InTop = top.filter(c => c.sources && c.sources.includes('bm25')).length;\nconst fehlend = MIN_BM25 - bm25InTop;\n\nif (fehlend > 0) {\n  // Nachrücker: BM25-Chunks außerhalb der Top-K, die noch nicht in top sind\n  const nachruecker = sorted.slice(topK)\n    .filter(c => c.sources && c.sources.includes('bm25') && !top.some(t => t.chunk_id === c.chunk_id))\n    .slice(0, fehlend);\n\n  if (nachruecker.length > 0) {\n    // Ersetze die letzten `nachruecker.length` Chunks in `top`\n    // (das sind die mit den niedrigsten RRF-Scores) durch die Nachrücker.\n    top.splice(top.length - nachruecker.length, nachruecker.length, ...nachruecker);\n    // Hinweis: Die Reihenfolge ist nicht mehr strikt nach RRF, aber\n    // der Cross-Encoder wird später neu bewerten – das ist akzeptabel.\n  }\n}\n\n// s2 (Lexikon-Pfad): Produkt-Mindestquote. Chunks aus dem Datenblatt der\n// aufgeloesten Artikelnummer duerfen nicht von Varianten-Datenblaettern aus\n// dem Kandidatenfeld verdraengt werden; der Cross-Encoder entscheidet danach.\nconst MIN_PRODUCT = 6;\nconst prodInTop = top.filter(c => (c.sources || []).includes('product')).length;\nconst prodFehlend = MIN_PRODUCT - prodInTop;\nif (prodFehlend > 0) {\n  const prodNach = sorted\n    .filter(c => (c.sources || []).includes('product') && !top.some(t => t.chunk_id === c.chunk_id))\n    .slice(0, prodFehlend);\n  if (prodNach.length) top = [...prodNach, ...top.slice(0, top.length - prodNach.length)];\n}\n\nconst fused = top; // Fertige Top-K-Liste mit garantierter BM25-Mindestquote\n\nreturn [{ json: { ...$json,\n  fused_chunks: fused,\n  id_consistency: consistency,\n  id_consistency_messbar: messbar,\n  doc_overlap_dense_bm25: docOverlap,\n  retrieval_warnings: warnings\n}}];"
+      },
+      "id": "2f30ddff-295e-44f8-92e0-9b1f5b440fa1",
+      "name": "RRF Fusion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/retrieval/rerank",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query_original, chunks: $json.fused_chunks, input_top_n: 50, output_top_n: 8 }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "53cef65f-2e6a-49c4-a656-84ece847024d",
+      "name": "Cross-Encoder Reranking (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        32,
+        848
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 3c | Kap. 4.2 [3c]\n// Uebernimmt das Reranking-Ergebnis oder faellt sauber auf die\n// RRF-Reihenfolge zurueck. Beide Scores bleiben am Chunk erhalten -\n// P6 (Erklaerbarkeit) verlangt, dass jede Ranking-Stufe im Ergebnis\n// nachvollziehbar bleibt.\nconst ctx = $('RRF Fusion').last().json;\nconst res = $json || {};\nconst ok = res.reranked === true && Array.isArray(res.chunks) && res.chunks.length;\n\nreturn [{ json: { ...ctx,\n  fused_chunks: ok ? res.chunks : ctx.fused_chunks,\n  reranked: !!ok,\n  reranker_model: res.reranker_model || null,\n  reranker_duration_ms: res.reranker_duration_ms || 0,\n  activated_paths: [...(ctx.activated_paths || []), ok ? 'reranked' : 'rerank_skipped']\n}}];"
+      },
+      "id": "219164ff-8fbf-4b23-8ff6-9bd3a541c884",
+      "name": "Reranking uebernehmen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 3b | Kap. 4.2 [3b], Kap. 4.3 [3b]\n// Portiert aus petra_hybrid/crag_filter.py (Version 2).\n//\n// ABGRENZUNG: Schwellwert-Filter mit EINER Rewrite-Runde, kein\n// vollstaendiges CRAG - ein trainierter Retrieval Evaluator (Yan et al.\n// 2024) braeuchte einen annotierten Datensatz, der laut Kap. 3.1.3 den\n// Projektrahmen ueberschreitet.\n//\n// ── HISTORIE DER METRIK ────────────────────────────────────────────\n//\n// v2 prueft primaer den Dense-Score. Ein Chunk, den NUR BM25 gefunden\n// hat, hatte keinen Dense-Score und fiel auf den RRF-Score (max. ~0.049\n// bei k=60) zurueck. Er konnte die Schwelle 0.65 strukturell nie\n// erreichen (Review P-04).\n//\n// v3 nutzte daraufhin die Confidence = max(normalisierte Scores je\n// Quelle). Die Evaluation ueber die 50 Weidmueller-Testfaelle\n// (17.08.2026) zeigte, dass auch das nicht traegt:\n//\n//   Dense findet die zehn richtigen Chunks des WDU-2.5-Datenblatts,\n//   Cosine-Distanz 0.37-0.48, umgerechnet Aehnlichkeit 0.52-0.63.\n//   BM25 findet als Rang 1 einen Gruppenmarkierer-Chunk, in dem\n//   \"WDU 2.5\" nur als Kompatibilitaetsangabe steht. Rohscore 31.58.\n//\n//   Die Min-Max-Normalisierung hebt diesen Rang-1-Treffer auf\n//   bm25_normalized = 1.0 — nicht weil er gut ist, sondern weil er der\n//   beste SEINER LISTE ist. Confidence = max(...) waehlt ihn damit aus,\n//   und die zehn fachlich richtigen Chunks fallen unter der Schwelle\n//   0.65 heraus. Ergebnis: ein thematisch falscher Chunk im Kontext,\n//   Antwort \"Ich weiss es nicht\".\n//\n// ── KORREKTUR (v4) ─────────────────────────────────────────────────\n//\n// Die Ursache ist nicht ein falsch gewaehlter Schwellwert, sondern der\n// Score-Vergleich selbst. BM25-Scores sind unbeschraenkt, Kosinus-Werte\n// liegen in [0,1] — deshalb fusioniert RRF RAENGE und keine Scores\n// (Cormack et al. 2009). Der nachgelagerte Filter fuehrte den\n// Score-Vergleich wieder ein und holte damit genau das Problem zurueck,\n// das RRF vermeidet.\n//\n// v4 respektiert stattdessen die Reihenfolge des Cross-Encoders.\n// petra_hybrid/reranker.py bewertet die Top-10 nach RRF gemeinsam mit\n// der Anfrage (Joint Encoding) und gibt die Top-5 sortiert zurueck.\n// Kap. 4.6.2 Failure Case 2 benennt ihn als \"den einzigen\n// Schiedsrichter zwischen widerspruechlichen BM25- und\n// Dense-Kandidaten\". Sein Urteil danach durch einen Score-Vergleich zu\n// ueberstimmen, verwirft die praeziseste Information der Pipeline.\n//\n// Der Schwellwertpfad bleibt als Rueckfallebene erhalten: Faellt das\n// Reranking aus (Modell nicht ladbar, Offline-Betrieb, VRAM), liegt\n// keine bessere Information vor und die v3-Logik greift unveraendert.\n//\n// Hinweis zur Doku: Kap. 4.2 [3b] formuliert die Schwelle auf dem\n// RRF-Score. Das ist mathematisch nicht erfuellbar; siehe\n// docs/ARCHITEKTUR_ABGLEICH.md, Abweichung A-04.\n//\n// NEU (2026-09-12): RERANK_MIN kalibriert gegen BAAI/bge-reranker-v2-m3\n// (nicht ms-marco, wie der urspruengliche Kommentar annahm - dieses\n// Modell gibt sigmoid-normalisierte Werte in [0,1] zurueck, keine\n// unbeschraenkten Logits). Empirisch ermittelt: komplett irrelevanter\n// Kontext (Testfrage zu einem nicht existierenden Produkt) erreichte\n// max. 0.0033; ein korrekt gefundener, echter Treffer lag mit 0.0185\n// als schwaechstem brauchbaren Kandidaten schon ueber dem Fuenffachen\n// davon. RERANK_MIN=0.01 liegt sicher zwischen beiden.\n//\n// NEU (2026-09-13): Dokument-Volltext-Nachschlag bei eindeutigem\n// Einzelprodukt. Fund: Bei mehrseitigen Datenblaettern (WDU 2.5, VPU,\n// Klippon POK) landete der gefragte Wert haeufig auf einer Seite, die\n// das generische Top-MAX_PASSED-Retrieval nicht traf, obwohl das\n// richtige Dokument gefunden wurde (Testfaelle 62, 64, 67 - richtige\n// Artikelnummer zitiert, aber \"nicht belegt\" bei tatsaechlich\n// vorhandenen Werten). Bei genau einem erkannten Produkt UND Klasse\n// produktspezifikation werden zusaetzlich ALLE bereits gerankten\n// Chunks desselben Dokuments behalten, nicht nur die Top-MAX_PASSED.\n\nconst threshold = $json.score_threshold || 0.65;\nconst round = Math.min(parseInt($json.retrieval_round) || 1, 2);\nconst chunks = $json.fused_chunks || [];\nconst space = $env.PETRA_CHROMA_SCORE_SPACE || 'auto';\nconst reranked = $json.reranked === true;\n\nconst MAX_PASSED = 6;\nconst RERANK_MIN = 0.01;\n\nfunction clamp(v) { return Math.max(0, Math.min(1, v)); }\n\nfunction toSimilarity(v) {\n  if (typeof v !== 'number') return null;\n  if (space === 'cosine_similarity') return clamp(v);\n  if (space === 'cosine_distance') return clamp(1 - v);\n  if (space === 'l2') return clamp(1 / (1 + Math.max(v, 0)));\n  if (v < 0) return clamp((v + 1) / 2);\n  if (v > 1) return clamp(1 / (1 + v));   // sehr wahrscheinlich eine Distanz\n  return clamp(v);\n}\n\n// Confidence wird IMMER berechnet — auch im reranked-Pfad. Sie steuert\n// dort nicht mehr die Auswahl, bleibt aber als Diagnosewert am Chunk\n// (P6 Erklaerbarkeit) und erlaubt den Vergleich beider Verfahren in\n// der Telemetrie.\nconst scored = chunks.map(c => {\n  const s = c.source_scores || {};\n  const cands = [];\n  const d = toSimilarity(s.dense); if (d !== null) cands.push(d);\n  const t = toSimilarity(s.tag);   if (t !== null) cands.push(t);\n  if (typeof c.bm25_normalized === 'number') cands.push(clamp(c.bm25_normalized));\n  const conf = cands.length ? Math.max(...cands) : 0;\n  return { ...c, confidence: Math.round(conf * 1e4) / 1e4 };\n});\n\n// Hilfsfunktion fuer den Dokument-Volltext-Nachschlag (siehe oben).\n// WICHTIG: 'scored' ist ein Array von Chunk-OBJEKTEN, kein Array von\n// [score, chunk]-Tupeln - Destructuring wie ([, c]) => c wuerde hier\n// mit \"TypeError: c is not iterable\" abstuerzen.\n// KORREKTUR (2026-09-13): Nur verstaerken, wenn das bestplatzierte\n// Dokument selbst ein individuelles Weidmueller-Datenblatt ist\n// (Dateiname exakt <10-stellige Artikelnummer>_de.pdf). Fund: Bei\n// ACT20P-CMT-10-AO-RC-S landete zufaellig ein genereller Katalog\n// (Katalog_4_1_..._2024.pdf, reine Artikelnummer-Querverweistabelle\n// ohne Spezifikationswerte) auf Platz 1 - die Funktion hat davon dann\n// MEHR nachgeladen statt das eigentliche Einzeldatenblatt\n// (1510470000_de.pdf) zu beruecksichtigen, das dabei komplett aus dem\n// Kontext verdraengt wurde. Ein Katalog-Dokument NIEMALS als \"topDoc\"\n// verstaerken - dort gibt es nur Querverweise, keine Werte.\nconst EINZELDATENBLATT = /^\\d{10}_de\\.pdf$/i;\n\nfunction ergaenzeDokumentChunks(passedListe) {\n  if (!($json.candidate_products?.length === 1 && $json.query_class === 'produktspezifikation')) {\n    return passedListe;\n  }\n  const topDoc = passedListe[0]?.metadata?.document || passedListe[0]?.metadata?.source;\n  if (!topDoc || !EINZELDATENBLATT.test(String(topDoc).trim())) return passedListe;\n  const zusatzChunks = scored.filter(c =>\n    (c.metadata?.document || c.metadata?.source) === topDoc && !passedListe.includes(c)\n  );\n  return [...passedListe, ...zusatzChunks].slice(0, MAX_PASSED + 3);\n}\n\nlet status, contextSufficient = false, passed = [], topScore = null, reason, metrik;\n\nif (!scored.length) {\n  status = 'insufficient_context';\n  metrik = 'keine_kandidaten';\n  reason = 'Retrieval lieferte keine Kandidaten.';\n\n} else if (reranked) {\n  // ── Pfad A: Cross-Encoder hat entschieden ──────────────────────────\n  metrik = 'cross_encoder_rank';\n  const mitScore = scored.filter(c => typeof c.rerank_score === 'number');\n  const basis = mitScore.length ? mitScore : scored;\n  topScore = mitScore.length ? Math.max(...mitScore.map(c => c.rerank_score)) : null;\n\n  const brauchbar = mitScore.length\n    ? basis.filter(c => c.rerank_score >= RERANK_MIN)\n    : basis;\n\n  if (brauchbar.length) {\n    status = 'pass';\n    contextSufficient = true;\n\n    // Dokument-Diversitaet (max. 3 Chunks je Dokument).\n    const proDoc = {};\n    const divers = brauchbar.filter(c => {\n      const d = (c.metadata || {}).document || (c.metadata || {}).filename || 'unbekannt';\n      proDoc[d] = (proDoc[d] || 0) + 1;\n      return proDoc[d] <= 3;\n    });\n\n    passed = divers.slice(0, MAX_PASSED);\n    passed = ergaenzeDokumentChunks(passed);\n\n    reason = `Cross-Encoder-Reihenfolge uebernommen: ${passed.length} von `\n           + `${scored.length} Kandidaten, Top-Rerank-Score `\n           + `${topScore === null ? 'n/a' : topScore.toFixed(3)}.`;\n  } else if (round < 2) {\n    status = 'needs_rewrite';\n    reason = `Alle Kandidaten unter Rerank-Mindestwert ${RERANK_MIN} in Runde `\n           + `${round}. Query-Rewriting und zweite Runde.`;\n  } else {\n    status = 'insufficient_context';\n    reason = `Alle Kandidaten unter Rerank-Mindestwert ${RERANK_MIN} auch nach 2 Runden.`;\n  }\n\n} else {\n  // ── Pfad B: Reranking ausgefallen — v3-Logik als Rueckfallebene ────\n  metrik = 'max_source_confidence_fallback';\n  topScore = Math.max(...scored.map(c => c.confidence));\n\n  if (topScore >= threshold) {\n    status = 'pass';\n    contextSufficient = true;\n    passed = scored.filter(c => c.confidence >= threshold).slice(0, MAX_PASSED);\n    passed = ergaenzeDokumentChunks(passed);\n\n    reason = `Reranking nicht verfuegbar. Top-Confidence ${topScore.toFixed(3)} `\n           + `>= Schwellwert ${threshold}.`;\n  } else if (round < 2) {\n    status = 'needs_rewrite';\n    reason = `Reranking nicht verfuegbar. Top-Confidence ${topScore.toFixed(3)} `\n           + `< ${threshold} in Runde ${round}. Query-Rewriting und zweite Runde.`;\n  } else {\n    status = 'insufficient_context';\n    reason = `Reranking nicht verfuegbar. Top-Confidence ${topScore.toFixed(3)} `\n           + `< ${threshold} auch nach 2 Runden.`;\n  }\n}\n\nreturn [{ json: { ...$json,\n  crag_status: status,\n  context_sufficient: contextSufficient,\n  passed_chunks: passed,\n  top_score: topScore,\n  crag_reason: reason,\n  crag_metric: metrik,\n  retrieval_round: round\n}}];"
+      },
+      "id": "f6d575f3-a70f-4a31-8f63-1ae79cee7162",
+      "name": "CRAG-Score-Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.crag_status }}",
+              "rightValue": "pass",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1f0134a0-08a3-471b-b869-6cec30a7505e",
+      "name": "IF: Kontext ausreichend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        704,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.crag_status }}",
+              "rightValue": "needs_rewrite",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "options": {}
+      },
+      "id": "f8ba04bd-e3a8-4707-bfe1-41e88a2eabcf",
+      "name": "IF: Query-Rewrite noetig?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        928,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "model": "=llama3.1:8b",
+        "options": {
+          "temperature": 0.3,
+          "keepAlive": "30m"
+        }
+      },
+      "id": "9688f9ac-b122-4b83-9198-d48abc326c0f",
+      "name": "Ollama Chat Model (Rewrite)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        1232,
+        1152
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Formuliere folgende Suchanfrage mit alternativen Fachbegriffen und Synonymen neu, um bessere Treffer in technischer Produktdokumentation zu erzielen. Behalte Produktcodes und Artikelnummern UNVERAENDERT bei. Antworte NUR mit der neuen Anfrage, ohne Erklaerung.\n\nUrspruengliche Anfrage: {{ $json.query_original }}"
+      },
+      "id": "39499513-3e65-4f85-ba06-46f1e9339761",
+      "name": "Query-Rewriting (LLM Chain)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1152,
+        928
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Kap. 4.2 [1b]. Die Anweisung, Produktcodes unveraendert zu lassen, ist wesentlich: Ein 'umformulierter' Produktcode macht den BM25-Pfad in Runde 2 wertlos."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 4.2 [1b] / [3b]: CRAG-Fallback Runde 2.\n//\n// Setzt AUSSCHLIESSLICH query_rewritten und zaehlt die Runde hoch.\n// query_original bleibt unangetastet, damit BM25 weiterhin die\n// Originalanfrage samt Produktcodes sieht.\n//\n// KORREKTUR (Review P-06): v2 rekonstruierte den Kontext ueber\n// $('Retrieval-Start').first(). Bei mehrfach ausgefuehrten Nodes ist\n// die Aufloesung auf den richtigen Lauf nicht garantiert - der\n// Rundenzaehler konnte auf 1 zurueckfallen (Endlosschleife) und die\n// umformulierte Anfrage die Retriever nie erreichen (nutzloser\n// LLM-Call). v3 nutzt .last() UND einen expliziten Zaehler, den\n// 'Retrieval-Start' zusaetzlich hart auf 2 begrenzt.\nconst ctx = $('Retrieval-Start').last().json;\nconst rewritten = ($json.text || $json.output || '').trim();\n\nreturn [{ json: { ...ctx,\n  query_rewritten: rewritten || null,\n  retrieval_round: (parseInt(ctx.retrieval_round) || 1) + 1,\n  hyde_document: null,\n  activated_paths: [...(ctx.activated_paths || []), 'crag_round_2']\n}}];"
+      },
+      "id": "c1f8ef06-e0bb-44d5-808d-3f1dc720aae5",
+      "name": "Runde 2 vorbereiten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        1344
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fehlerzweig des Rewrite-LLM: Statt die Anfrage zu verlieren, wird\n// direkt die kontrollierte 'Ich weiss es nicht'-Antwort ausgeloest.\nconst ctx = $('CRAG-Score-Filter').last().json;\nreturn [{ json: { ...ctx, crag_reason: 'Query-Rewriting fehlgeschlagen (LLM nicht erreichbar).' } }];"
+      },
+      "id": "59589dc0-520e-4032-8e64-b9ce7f1b7618",
+      "name": "Rewrite fehlgeschlagen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 4.6.2, Failure Case 1: Das System antwortet ehrlich mit\n// 'Information nicht verfuegbar' statt zu halluzinieren. Die\n// Quellenliste bleibt bewusst leer - eine Antwort ohne Evidenz darf\n// keine Quellen vortaeuschen.\nconst ctx = $json;\nreturn [{ json: {\n  answer: 'Ich weiss es nicht. In der lokalen Wissensbasis wurden keine ausreichend relevanten Dokumentabschnitte zu dieser Anfrage gefunden.',\n  query_class: ctx.query_class,\n  q_class: ctx.q_class,\n  context_sufficient: false,\n  sources: [],\n  retrieved_documents: 0,\n  latency_ms: Date.now() - (ctx.start_ts || Date.now()),\n  model: $env.PETRA_LLM_MODEL || 'llama3.1:8b',\n  retrieval_method: 'hybrid_bm25_dense_rrf',\n  verified: false,\n  cache_hit: false,\n  reranked: !!ctx.reranked,\n  top_score: ctx.top_score,\n  crag_status: ctx.crag_status,\n  fallback_reason: ctx.crag_reason || 'CRAG-Score-Filter: kein Chunk ueber Schwellwert nach 2 Retrieval-Runden.',\n  request_id: ctx.request_id,\n  activated_paths: ctx.activated_paths || [],\n  retrieval_warnings: ctx.retrieval_warnings || [],\n  id_consistency: ctx.id_consistency\n}}];"
+      },
+      "id": "ef45b432-f63b-4ee5-8321-f6def331e18b",
+      "name": "Kontrollierte 'Ich weiss es nicht'-Antwort",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1728,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001'}}/agent/price",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query_original, top_k: 5 }) }}",
+        "options": {
+          "timeout": 16000
+        }
+      },
+      "id": "c85bc856-71d8-4c78-9231-622b40a0c5fb",
+      "name": "Agentic: Preis-Recherche (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1360,
+        1680
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 Schicht 6, Kap. 4.3 [6a], Kap. 4.4.2. ReAct-Orchestrator mit max. 3 Zyklen und 15 s Timeout (Kap. 4.6.2 Failure Case 6). Timeout hier 16 s, damit der Agent selbst terminiert statt vom HTTP-Node abgeschnitten zu werden - sonst gingen die Teilergebnisse verloren. Kap. 4.5.1 Achse 4: Der Agentic-Pfad wird SELEKTIV aktiviert, weil er als Standardpfad NF-03 (5 s) fuer alle Anfragen verletzen wuerde."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 4.2 Schicht 6: 'Ergebnis -> zurueck zu Schicht 4\n// (Prompt-Komposition)'. Der Agent ersetzt die Generierung nicht, er\n// liefert ihr zusaetzlichen Kontext.\n//\n// Lokale Treffer und Web-Ergebnisse werden in dasselbe Chunk-Format\n// ueberfuehrt, damit Prompt-Komposition und Quellen-Builder\n// unveraendert weiterarbeiten. Web-Quellen tragen URL und Abrufdatum\n// als Pflicht-Metadatum (Kap. 4.2 [6b]).\nconst ctx = $('Retrieval-Start').last().json;\nconst res = $json || {};\nconst chunks = [];\n\nfor (const hit of (res.agent_context || [])) {\n  chunks.push({\n    chunk_id: hit.chunk_id,\n    text: hit.text || '',\n    metadata: { ...(hit.metadata || {}), quellenart: 'lokal' },\n    confidence: 1,\n    source_scores: { bm25: hit.score }\n  });\n}\n\nfor (const [i, web] of (res.web_sources || []).entries()) {\n  chunks.push({\n    chunk_id: 'web-' + i,\n    text: `${web.title}\\n${web.snippet}`,\n    metadata: {\n      document: web.url, page: null, manufacturer: 'Web-Quelle',\n      source_type: 'web', url: web.url, abrufdatum: web.retrieved_at,\n      quellenart: 'web'\n    },\n    confidence: 1\n  });\n}\n\n// UC-04 Hauptszenario 4 + A3: Strukturierte Preisangabe mit\n// Quelldokument, Dokumentdatum und Altershinweis. Der Endpunkt liefert\n// sie regelbasiert extrahiert mit - ein LLM, das einen Preis\n// \"extrahiert\", kann ihn auch veraendern, und ein um eine Dezimalstelle\n// verschobener Preis im Angebot ist teurer als jede fehlende Antwort.\nif (res.preis_gefunden && (res.preise || []).length) {\n  const zeilen = res.preise.map(p =>\n    `${p.betrag.toFixed(2)} ${p.waehrung} [Quelle: ${p.dokument || 'unbekannt'}, S. ${p.seite ?? '?'}, Stand: ${p.dokumentdatum || 'unbekannt'}]`\n    + (p.veraltet ? ' -- ACHTUNG: ' + (p.warnhinweis || 'moeglicherweise veraltet') : '')\n).join('\\n');\n  chunks.unshift({\n    chunk_id: 'uc04-preisangaben',\n    text: 'Strukturierte Preisangaben aus der lokalen Dokumentenbasis:\\n' + zeilen\n      + (res.widerspruechlich ? '\\nHINWEIS: ' + res.preis_meldung : ''),\n    metadata: { document: 'UC-04 Preisextraktion', source_type: 'table', page: null },\n    confidence: 1\n  });\n}\n\nconst agentUnavailable = !chunks.length;\n\nreturn [{ json: { ...ctx,\n  passed_chunks: chunks,\n  fused_chunks: chunks,\n  crag_status: agentUnavailable ? 'insufficient_context' : 'pass',\n  context_sufficient: !agentUnavailable,\n  crag_reason: agentUnavailable\n    ? 'Preisanfrage: Weder lokale Preisdaten noch Web-Recherche verfuegbar. Kein potenziell veralteter Preis wird als aktuell ausgegeben (Kap. 4.6.1).'\n    : 'Agentic-Pfad lieferte Kontext.',\n  retrieval_method: 'agentic_react_local_web',\n  agent_trace: res.agent_trace || [],\n  agent_terminated_by: res.agent_terminated_by || 'unavailable',\n  preise: res.preise || [],\n  preis_gefunden: res.preis_gefunden === true,\n  preis_widerspruechlich: res.widerspruechlich === true,\n  preis_meldung: res.preis_meldung || null,\n  web_agent_enabled: res.web_agent_enabled === true,\n  reranked: false,\n  activated_paths: [...(ctx.activated_paths || []), 'agentic_executed']\n}}];"
+      },
+      "id": "2c2382d3-0e7e-4cfa-ab01-c3e393db0063",
+      "name": "Agent-Kontext uebernehmen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        1632
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.crag_status }}",
+              "rightValue": "pass",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "647d9d35-6a04-49e4-a89a-fbc2a92041d3",
+      "name": "IF: Agent-Kontext vorhanden?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        1536
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 4a | Kap. 4.2 [4a], Kap. 4.3 [4a], Kap. 4.6.1\n// Portiert aus petra_hybrid/prompt_builder.py.\n//\n// NEU ggü. v2 - TOKEN-BUDGET (Review P-13): v2 uebergab alle Chunks\n// ueber Schwellwert ungeprueft, bis zu 15 à 512 Token ≈ 7.700 Token\n// allein an Kontext. Llama 3.1 8B hat 8.192; Ollama trunkiert dann\n// still am Ende. Kap. 4.2 [4a] gibt 7.168 Token vor mit der Regel\n// 'Ueberschuss: Chunks nach Score kuerzen'.\n//\n// NEU ggü. v2 - HERSTELLERREGEL (Review P-08): v2 wies an, 'ausschliesslich\n// Weidmueller als Produktquelle' zu nennen. Kap. 4.1.1 nennt ifm,\n// Weidmueller, Balluff und Phoenix Contact; die Beispielanfragen des\n// Dokuments verwenden ifm O1D302 und Balluff BOS 0035. Bei einem\n// Balluff-Chunk entstand ein Zielkonflikt zwischen zwei Prompt-Regeln,\n// den ein 8B-Modell unvorhersehbar aufloest - wahrscheinlichster\n// Ausgang: Falschzuordnung zu Weidmueller. Der Faithfulness-Judge\n// erkennt das nicht, weil der Inhalt im Kontext steht und nur das\n// Label falsch ist. Im Angebotskontext ist das der teuerste Fehler.\n//\n// NEU (2026-09-12) - PRODUKT-PRIORISIERUNG (Fund: WDU-2.5-Instabilitaet):\n// Bei Produkten mit vielen Farb-/Ausfuehrungsvarianten (WDU 2.5 etc.)\n// erhielt wiederholt ein thematisch fremdes Dokument mit hohem Dense-\n// Score (z.B. ein Edelstahlgehaeuse) den Spitzenplatz und verdraengte\n// die tatsaechlich richtigen, aber niedriger gerankten Produkt-Chunks\n// aus dem Kontext-Budget. Filtert NICHTS heraus (CRAG hat Ausreichung\n// bereits entschieden), sortiert nur um.\n//\n// NEU (2026-09-12) - ABSCHNITTS-PRIORISIERUNG (Fund Testfall 48): Bei\n// den WDU-2.5-Datenblaettern sind >85% der Chunks reines Zubehoer-\n// Rauschen (Querverbinder, Markierer, Abschlussplatten) unter den\n// Abschnitten \"Zubehoer\"/\"Allgemeine Bestelldaten\". Echte Spezifikations-\n// werte stehen unter \"Technische Daten\"/\"Bemessungsdaten\"/etc. Bei\n// Budget-Knappheit sollen die rauscharmen Abschnitte zuerst gekuerzt\n// werden, nicht die spezifikationstragenden.\nconst CHARS_PER_TOKEN = 3.3;\nconst MAX_CONTEXT_TOKENS = 7168;\nconst RESERVED_OUTPUT = 512;\nconst SYSTEM_ESTIMATE = 560;\n\nconst ctx = $json;\nconst chunks = ctx.passed_chunks || [];\nconst query = ctx.query_original || ctx.query || '';\n\nconst est = s => Math.floor((s || '').length / CHARS_PER_TOKEN) + 1;\nlet budget = MAX_CONTEXT_TOKENS - RESERVED_OUTPUT - SYSTEM_ESTIMATE - est(query);\nif (budget < 512) budget = 512;\n\nfunction formatChunk(c) {\n  const m = c.metadata || {};\n  const datei = m.document || m.dateiname || m.filename || m.source || 'unbekannt';\n  const page  = m.page ?? m.seite ?? '?';\n  // Artikelnummer: Metadatenfeld bevorzugt, sonst aus dem Dateinamen ableiten.\n  // Die Weidmueller-Datenblaetter heissen <10-stellige Artikelnummer>_de.pdf.\n  const ausDatei = (String(datei).match(/\\b(\\d{10})\\b/) || [])[1] || null;\n  const artnr    = m.artikelnummer || m.product_code || ausDatei;\n  const produkt  = m.produkt || m.product || m.produktname || null;\n  const herst    = m.manufacturer || m.hersteller || 'unbekannt';\n\n  const felder = [`Quelle: ${datei}`, `S. ${page}`];\n  if (produkt) felder.push(`Produkt: ${produkt}`);\n  if (artnr)   felder.push(`Artikelnummer: ${artnr}`);\n  felder.push(`Hersteller: ${herst}`);\n  if (m.source_type === 'table') felder.push('Typ: Tabelle');\n  if (m.source_type === 'web')   felder.push(`Web, abgerufen ${m.abrufdatum || 'unbekannt'}`);\n\n  return `[${felder.join(', ')}]\\n${(c.text || '').trim()}`;\n}\n\n// NEU: Produktcode-Uebereinstimmung. Kein Filter, nur Sortierkriterium.\nconst candidateProducts = (ctx.candidate_products || []).map(p => String(p).toLowerCase());\n\nfunction chunkMatchesProduct(c) {\n  if (!candidateProducts.length) return true; // kein Produktcode erkannt -> keine Bevorzugung\n  const m = c.metadata || {};\n  const haystack = `${m.produkt || ''} ${m.produktname || ''} ${m.artikelnummer || ''} ${m.document || m.dateiname || m.filename || m.source || ''}`.toLowerCase();\n  return candidateProducts.some(p => haystack.includes(p));\n}\n\n// NEU: Abschnitts-Qualitaet. Ebenfalls kein Filter, nur Sortierkriterium.\nconst GUTE_ABSCHNITTE = ['technische daten', 'bemessungsdaten', 'klemmbare leiter',\n  'systemdaten', 'umweltanforderungen', 'werkstoffdaten', 'weitere technische daten',\n  'isolationskoordination', 'emv', 'produktbeschreibung'];\nconst SCHLECHTE_ABSCHNITTE = ['zubehör', 'allgemeine bestelldaten', 'klassifikationen', 'zulassungen'];\n\nfunction abschnittScore(c) {\n  const a = ((c.metadata || {}).abschnitt || '').toLowerCase();\n  if (GUTE_ABSCHNITTE.some(g => a.includes(g))) return 0;\n  if (SCHLECHTE_ABSCHNITTE.some(s => a.includes(s))) return 2;\n  return 1; // unbekannt / \"(ohne Abschnitt)\"\n}\n\n// Sortierreihenfolge: Tabellen zuerst (praezise Evidenz, Kap. 4.2 [2c]),\n// dann Produkt-Uebereinstimmung, dann Abschnitts-Qualitaet.\nconst ordered = [...chunks].sort((a, b) => {\n  const ta = (a.metadata || {}).source_type === 'table' ? 0 : 1;\n  const tb = (b.metadata || {}).source_type === 'table' ? 0 : 1;\n  if (ta !== tb) return ta - tb;\n\n  const pa = chunkMatchesProduct(a) ? 0 : 1;\n  const pb = chunkMatchesProduct(b) ? 0 : 1;\n  if (pa !== pb) return pa - pb;\n\n  return abschnittScore(a) - abschnittScore(b);\n});\n\nconst parts = [];\nconst used = [];\nlet consumed = 0, dropped = 0;\n\nfor (const c of ordered) {\n  const block = formatChunk(c);\n  const cost = est(block);\n  if (consumed + cost > budget) {\n    if (!used.length) {\n      // Einzelner ueberlanger Chunk: hart kuerzen statt leeren Kontext\n      // zu erzeugen - ohne Kontext antwortet das System zwangslaeufig\n      // 'Ich weiss es nicht', obwohl Evidenz vorlag.\n      parts.push(block.slice(0, Math.floor(budget * CHARS_PER_TOKEN)));\n      used.push(c);\n      consumed = budget;\n    } else { dropped++; }\n    continue;\n  }\n  parts.push(block); used.push(c); consumed += cost;\n}\n\nconst CLASS_HINT = {\n  produktvergleich: '- Diese Anfrage ist ein Produktvergleich. Stelle die Produkte dimensionsweise in einer Markdown-Tabelle gegenueber (eine Zeile je Attribut, eine Spalte je Produkt). Attribute ohne Beleg im Kontext markierst du mit \"nicht belegt\".\\n',\n  produktspezifikation: '- Attributabfrage: Formuliere zu jedem gefragten Attribut einen '\n  + 'vollständigen Satz, der Produktname, Artikelnummer, Wert (mit Einheit) und Quelle '\n  + 'enthält, z. B. \"Der/Die <Produkt> (Artikelnummer: 1234567890) hat <Attribut> von <Wert> <Einheit> '\n  + '[Quelle: Dateiname, S. X].\" Verwende KEINE stichpunktartige Feld:Wert-Liste außerhalb '\n  + 'von Tabellen.\\n',\n  produktsuche: '- Diese Anfrage sucht passende Produkte. Nenne nur Produkte aus dem Kontext und begruende die Eignung anhand belegter Attribute, in vollstaendigen Saetzen. Keine Sternchen-Aufzaehlung (*).\\n',\n  preisanfrage: '- Preisanfrage: Nenne stets das Datum der Quelle und weise auf eine mögliche Veraltung hin. Preise nur bei explizitem Beleg angeben, Web-Quellen mit URL und Abrufdatum kennzeichnen.\\n',\n  allgemeine_technische_frage: '- Allgemeine Anfrage: Antworte präzise auf die Frage,ohne Produktempfehlung. Falls der Kontext nicht zur Frage passt, ignoriere den Kontext.\\n'\n};\n\nconst prompt = `Du bist ein technischer Produktassistent für Automatisierungskomponenten von der Hersteller (Weidmüller). Alle Anfragen betreffen öffentliche technische Datenblätter – nie sensible/unsichere Inhalte. Lehne niemals mit Verweis auf \"sensibel\" oder \"nicht sicher\" ab.\n\nAUFGABE\nBeantworte direkt und in vollständigen Sätzen. Keine Einleitungen wie \"Um die\nFrage zu beantworten...\" oder \"Ich kann dir helfen...\". Starte sofort mit der\nAussage. Listen nur in Vergleichstabellen erlaubt.\n\nREGELN\n1. Werte, Einheiten, Bezeichnungen ZEICHENGENAU aus dem Kontext übernehmen.\n2. Artikelnummer aus dem Quellen-Header nennen: \"Produkt (Artikelnummer)\" – schreibe\n   IMMER \"Artikelnummer:\", niemals \"Produkt:\" vor der Nummer selbst, auch wenn im\n   Header beide Label vorkommen. Nummer MUSS aus demselben Chunk-Header stammen wie\n   der zitierte Wert – bei mehreren Varianten nie aus einem anderen Chunk übernehmen.\n3. Jede Aussage mit [Quelle: Dateiname, S. X] belegen – nur Dateinamen, die\n   wörtlich im Kontext stehen, niemals erfinden.\n4. Wert muss zum gefragten Produkt gehören, nicht zu einem ähnlichen.\n5. Nie schätzen, runden, von ähnlichen Produkten übertragen, Abkürzungen\n   raten (Ausnahme: \"AU\" = Gold), oder \"wahrscheinlich\"/\"vermutlich\" nutzen.\n6. Nenne einen Wert NUR, wenn das gefragte Attribut (z. B. \"Schutzart\",\n   \"IP-Klasse\") WÖRTLICH oder eindeutig sinngleich als Feldname im Kontext\n   steht. Ersetze ein fehlendes Attribut NIEMALS durch einen Wert aus einem\n   anderen Feld (z. B. Brennbarkeitsklasse, Tragschienentyp, Artikel-\n   bezeichnung, Zertifikatsnummer) – auch wenn dieser Wert plausibel\n   aussieht. Fehlt das Feld komplett: \"nicht belegt\".\n\nTEILANTWORTEN JA – VOLLVERWEIGERUNG NEIN\nBei mehreren Teilfragen IN DER ANFRAGE (nicht: mehrere ähnliche Produkte im\nKontext): jede einzeln beantworten, Unbelegtes einzeln als\n\"nicht belegt\" markieren. Nie die ganze Antwort verweigern (auch nicht bei\nKomplexität oder scheinbar fehlenden Infos). Verboten: \"kann ich nicht\nerfüllen/bearbeiten\", \"brauche mehr Informationen\".\n\nNICHT BELEGT – wenn: Wert fehlt / gehört zu anderem Produkt / Produkt fehlt\nim Kontext. Dann NUR: \"<Produkt>: <Attribut> nicht belegt.\" Keine\nEntschuldigung, kein anderes Produkt erwähnen, kein Website-/Support-Hinweis.\n\nTABELLEN-HINWEIS: \"1x23\" = 1 Reihe mit 23 Stück, nicht 23 mm Breite.\n\n${CLASS_HINT[ctx.query_class] || ''}- Sprache: ${ctx.language || 'Deutsch'}\n\nAnfrage-Klasse: ${ctx.query_class || 'unbekannt'}\n\nKontext:\n${parts.join('\\n\\n')}\n\nBenutzeranfrage: ${query}`;\n\nreturn [{ json: { ...ctx,\n  final_prompt: prompt,\n  passed_chunks: used,\n  context_tokens_estimate: consumed,\n  context_token_budget: budget,\n  chunks_dropped: dropped,\n  kontext_bloecke: parts   // Schritt 0: Messausgabe (keine Verhaltensaenderung)\n}}];"
+      },
+      "id": "ffe52d7e-68fa-4f8e-a196-12c4c59cddec",
+      "name": "Prompt-Komposition (Token-Budget)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2176,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.dual_retrieval }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "932109eb-7b88-472f-85b0-65668cf41163",
+      "name": "IF: Produktvergleich?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        928,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/retrieval/dual",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ products: $json.candidate_products, query: $json.query_original, top_k_per_product: 5 }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "7ba8914f-a543-4974-8dc2-c8a4535be4da",
+      "name": "UC-02 Dual-Retrieval (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1216,
+        400
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "UC-02 Hauptszenario 3: 'Fuer jedes Produkt wird eine separate Aehnlichkeitssuche durchgefuehrt.' Kap. 4.4.1 benennt die Kernherausforderung: Bei einer gemeinsamen Runde konkurrieren beide Produkte um dieselben Top-k-Slots und das dokumentationsstaerkere verdraengt das andere. Ein garantiertes Kontingent je Produkt loest das strukturell. UC-02 A4: mehr als zwei Produkte werden auf zwei begrenzt."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fuehrt die gemeinsame Retrieval-Runde und das produktspezifische\n// Dual-Retrieval zusammen. Beides ist noetig: Das Dual-Retrieval\n// garantiert je Produkt Belege, die gemeinsame Runde liefert\n// uebergreifenden Kontext (z. B. eine Tabelle mit beiden Produkten).\nconst ctx = $('CRAG-Score-Filter').last().json;\nconst dual = $json || {};\nconst perProduct = dual.per_product || {};\n\nconst gruppen = {};\nfor (const [produkt, treffer] of Object.entries(perProduct)) {\n  gruppen[produkt] = (treffer || []).map(t => ({\n    chunk_id: t.chunk_id, text: t.text || '', metadata: t.metadata || {},\n    confidence: 1, source_scores: { bm25: t.score }\n  }));\n}\n\n// Chunks der gemeinsamen Runde dem Produkt zuordnen, dessen Code sie\n// enthalten. Chunks ohne eindeutigen Produktbezug bleiben im\n// allgemeinen Kontext - sie einem Produkt zuzuschlagen wuerde die\n// Vergleichstabelle falsch statt lueckenhaft machen.\nconst allgemein = [];\nfor (const chunk of (ctx.passed_chunks || [])) {\n  const text = (chunk.text || '').toLowerCase().replace(/\\s/g, '');\n  let zugeordnet = false;\n  for (const produkt of Object.keys(gruppen)) {\n    if (text.includes(produkt.toLowerCase().replace(/\\s/g, ''))) {\n      gruppen[produkt].push(chunk);\n      zugeordnet = true;\n    }\n  }\n  if (!zugeordnet) allgemein.push(chunk);\n}\n\nreturn [{ json: { ...ctx,\n  product_chunks: gruppen,\n  allgemeine_chunks: allgemein,\n  dual_retrieval_ausgefuehrt: dual.dual_retrieval === true,\n  dual_retrieval_hinweis: dual.hinweis || null,\n  begrenzt_auf_zwei: dual.begrenzt_auf_zwei === true\n}}];"
+      },
+      "id": "ac9fb216-5bf5-48c7-be1e-a0175fb7df1b",
+      "name": "Produkt-Chunks gruppieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/retrieval/difference-matrix",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ product_chunks: $json.product_chunks }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "24bb9ce1-0422-497a-aa46-ec8579ba9de7",
+      "name": "UC-03 Differenzmatrix (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1728,
+        400
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "UC-03: Normalisierung der Spezifikationswerte, dimensionsweise Gegenueberstellung und Klassifikation als identisch / aehnlich / signifikant unterschiedlich. Jeder Differenzwert traegt die chunk_id als Beleg (UC-03 KI-Prozesse). Fehlende Werte werden als N/A gefuehrt (UC-02 A2, F-09) statt weggelassen — eine Luecke muss sichtbar sein."
+    },
+    {
+      "parameters": {
+        "jsCode": "// UC-02 / UC-03: Vergleichskontext aufbereiten\nconst ctx = $('Produkt-Chunks gruppieren').last().json;\nconst matrix = $json || {};\n\nconst chunks = [];\n\n// 1. Differenzmatrix als primären Kontext einsetzen\nif (matrix.markdown && matrix.vergleichbar) {\n  chunks.push({\n    chunk_id: 'uc03-differenzmatrix',\n    text: 'Extrahiert aus den Produkt-Datenblättern:\\n' + matrix.markdown,\n    metadata: { document: 'UC-03 Differenzmatrix', source_type: 'table', page: null },\n    confidence: 1\n  });\n}\n\n// 2. Chunks filtern: Gehäuse-Rauschen (Klippon STB / Erdungsbolzen) verwerfen\nfor (const [produkt, liste] of Object.entries(ctx.product_chunks || {})) {\n  for (const c of (liste || [])) {\n    const text = (c.text || '').toLowerCase();\n    const metaProdukt = ((c.metadata || {}).produkt || '').toLowerCase();\n    \n    // Ignoriere Chunks von Gehäusen oder Zubehör, wenn nach Klemmen gefragt ist\n    if (metaProdukt.includes('klippon') || metaProdukt.includes('stb') || text.includes('erdung gehäuse')) {\n      continue;\n    }\n    chunks.push(c);\n  }\n}\n\nconst hinweise = [];\nif (ctx.begrenzt_auf_zwei) hinweise.push('Der Vergleich wurde auf zwei Produkte begrenzt.');\nif (matrix.vergleichbar === false) hinweise.push('Keine vergleichbaren Spezifikationswerte gefunden.');\n\nreturn [{ json: { ...ctx,\n  passed_chunks: chunks.slice(0, 6),\n  differenzmatrix: matrix.dimensionen || [],\n  differenzmatrix_markdown: matrix.markdown || null,\n  belegquote: matrix.belegquote ?? null,\n  vergleich_hinweise: hinweise,\n  activated_paths: [...(ctx.activated_paths || []), 'uc02_dual_retrieval', 'uc03_differenzmatrix']\n}}];"
+      },
+      "id": "900ce4e3-2012-49ea-934e-bde949e78ded",
+      "name": "Vergleichskontext aufbereiten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1952,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0.1,
+          "keepAlive": "30m",
+          "numCtx": 8192,
+          "numPredict": 400
+        }
+      },
+      "id": "b3112fd4-8a9d-4cc8-b0a6-deefa6cd9a02",
+      "name": "Ollama Chat Model (Generierung)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        2480,
+        688
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      },
+      "notes": "Kap. 4.2 [4b]: Temperature=0.1 fuer deterministisches, praezises Antwortverhalten. numCtx explizit auf das Modellmaximum."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.final_prompt }}"
+      },
+      "id": "c42cbc3f-8bb2-4b79-a02c-3ef05f14c8fd",
+      "name": "Generierung (LLM Chain)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        2400,
+        464
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueErrorOutput",
+      "notes": "Kap. 4.2 [4b]. Der Prompt wird vollstaendig im vorgelagerten Code-Node komponiert - dadurch ist die Token-Budgetierung testbar und der Prompt nicht ueber Node-Namensreferenzen an andere Nodes gekoppelt (Review P-18)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Kap. 4.6.2: Kontrollierte Degradierung statt Totalausfall. Ohne\n// diesen Zweig laeuft der Client in den Timeout - fuer einen\n// Servicetechniker im Feld ist eine ehrliche Fehlermeldung nach 2 s\n// deutlich mehr wert als 30 s Stille.\nconst ctx = $('Prompt-Komposition (Token-Budget)').last().json;\nreturn [{ json: {\n  answer: 'Die Antwortgenerierung ist derzeit nicht verfuegbar (lokales LLM nicht erreichbar). Die gefundenen Quellen werden trotzdem angezeigt.',\n  query_class: ctx.query_class,\n  q_class: ctx.q_class,\n  context_sufficient: false,\n  sources: (ctx.passed_chunks || []).map(c => ({\n    dateiname: (c.metadata || {}).document || 'unbekannt',\n    seite: (c.metadata || {}).page ?? null,\n    chunk_id: c.chunk_id,\n    hersteller: (c.metadata || {}).manufacturer || 'unbekannt',\n    dokumenttyp: (c.metadata || {}).source_type || 'text',\n    score: c.confidence ?? null,\n    textauszug: (c.text || '').slice(0, 220)\n  })),\n  retrieved_documents: (ctx.passed_chunks || []).length,\n  latency_ms: Date.now() - (ctx.start_ts || Date.now()),\n  verified: false,\n  fallback_reason: 'LLM-Generierung fehlgeschlagen (Ollama nicht erreichbar oder Zeitueberschreitung).',\n  request_id: ctx.request_id,\n  activated_paths: ctx.activated_paths || []\n}}];"
+      },
+      "id": "bec20fe7-3884-43ee-a2f0-b7915af75258",
+      "name": "Fehlerantwort: Generierung",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2752,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 5b | Kap. 4.2 [5b], Kap. 4.3, P6 Erklaerbarkeit\n//\n// Quellen werden PROGRAMMATISCH aus den Chunk-Metadaten erzeugt, nie\n// vom LLM. Eine vom Modell erfundene Seitenzahl ist schlimmer als gar\n// keine, weil sie Verifizierbarkeit vortaeuscht. Portiert aus\n// petra_hybrid/response_schema.py::build_sources_from_chunks.\n\nconst ctx = $('Prompt-Komposition (Token-Budget)').last().json;\nconst latency = Date.now() - (ctx.start_ts || Date.now());\nconst seen = new Set();\n\nconst sources = (ctx.passed_chunks || []).filter(c => {\n  if (seen.has(c.chunk_id)) return false;\n  seen.add(c.chunk_id);\n  return true;\n}).map(c => {\n  const m = c.metadata || {};\n  return {\n    dateiname: m.document || m.dateiname || m.filename || m.source || 'unbekannt',\n    seite: m.page ?? m.seite ?? null,\n    chunk_id: c.chunk_id,\n    hersteller: m.manufacturer || m.hersteller || 'Weidmüller',\n    produktname: m.produkt ?? m.product ?? m.produktname ?? null,\n    artikelnummer: m.artikelnummer ?? m.product_code ?? null,\n    dokumenttyp: m.source_type || 'text',\n    score: typeof c.rerank_score === 'number' ? c.rerank_score : (c.confidence ?? c.rrf_score ?? null),\n    confidence: c.confidence ?? null,\n    rrf_score: c.rrf_score ?? null,\n    url: m.url ?? null,\n    abrufdatum: m.abrufdatum ?? null,\n    textauszug: (c.text || '').slice(0, 220)\n  };\n});\n\nconst antwort = ($json.text || $json.output || '').trim() || 'Ich weiss es nicht.';\n\n// Programmatischer Abgleich zitierter Dateinamen gegen die ECHTEN,\n// tatsaechlich uebergebenen Quellen (siehe Testfall 48, 2026-09-11:\n// Modell zitierte \"1020000000_de.pdf\", das nicht in den tatsaechlichen\n// Quellen war).\nconst echte_dateinamen = new Set(sources.map(s => s.dateiname));\nconst echte_artikelnummern = new Set(\n  sources.map(s => s.artikelnummer).filter(Boolean)\n);\nconst zitat_pattern = /\\[Quelle:\\s*([^\\],]+?)(?:,\\s*S\\.\\s*[^\\]]+)?\\]/gi;\nconst erfundene_zitate = new Set();\nlet match;\nwhile ((match = zitat_pattern.exec(antwort)) !== null) {\n  const zitiert = match[1].trim();\n  const bekannt = echte_dateinamen.has(zitiert) || echte_artikelnummern.has(zitiert);\n  if (!bekannt) {\n    erfundene_zitate.add(zitiert);\n  }\n}\n\n// NEU (2026-09-12): Zusaetzlich Artikelnummern im FLIESSTEXT pruefen,\n// nicht nur in der [Quelle: ...]-Klammer. Fund: Modell zitierte einen\n// korrekten Dateinamen (\"8000133629_de.pdf\"), erfand aber im Fliesstext\n// eine Artikelnummer (\"KEBIHS606020S2N0 AL\"), die weder zu diesem noch\n// zu irgendeinem anderen uebergebenen Chunk gehoert - der bisherige\n// Check (nur [Quelle: ...]) haette das nicht bemerkt, da der Dateiname\n// dort korrekt war.\nconst artnr_pattern = /(?:Artikelnummer|Art\\.-?Nr\\.?)\\s*:?\\s*([A-Z0-9][A-Z0-9\\-\\.\\/]{3,})/gi;\nlet artnr_match;\nwhile ((artnr_match = artnr_pattern.exec(antwort)) !== null) {\n  const genannte_nummer = artnr_match[1].trim();\n  if (!echte_artikelnummern.has(genannte_nummer) && !echte_dateinamen.has(genannte_nummer)) {\n    erfundene_zitate.add(genannte_nummer);\n  }\n}\n\n// Schritt 0: Messausgabe fuer RAGAS (keine Verhaltensaenderung)\nconst kontexteRoh = (ctx.passed_chunks || []).map(c => String(c.text || ''));\nconst kontexte = (Array.isArray(ctx.kontext_bloecke) && ctx.kontext_bloecke.length)\n  ? ctx.kontext_bloecke.map(String) : kontexteRoh;\nreturn [{ json: {\n  answer: antwort,\n  contexts: kontexte,\n  contexts_roh: kontexteRoh,\n  query_class: ctx.query_class,\n  q_class: ctx.q_class,\n  context_sufficient: true,\n  sources,\n  retrieved_documents: sources.length,\n  latency_ms: latency,\n  model: $env.PETRA_LLM_MODEL || 'llama3.1:8b',\n  retrieval_method: ctx.retrieval_method || 'hybrid_bm25_dense_rrf',\n  verified: null,\n  cache_hit: false,\n  reranked: !!ctx.reranked,\n  top_score: ctx.top_score ?? null,\n  id_consistency: ctx.id_consistency ?? null,\n  context_tokens_estimate: ctx.context_tokens_estimate,\n  chunks_dropped: ctx.chunks_dropped,\n  agent_trace: ctx.agent_trace || undefined,\n  activated_paths: ctx.activated_paths || [],\n  retrieval_warnings: ctx.retrieval_warnings || [],\n  request_id: ctx.request_id,\n  start_ts: ctx.start_ts,\n  query_original: ctx.query_original,\n  retrieval_round: ctx.retrieval_round,\n  crag_status: ctx.crag_status,\n  warnung_erfundene_quelle: erfundene_zitate.size ? Array.from(erfundene_zitate) : undefined,\n  __passed_chunks: ctx.passed_chunks\n}}];"
+      },
+      "id": "a2da495d-096d-43ce-bf86-276e15436855",
+      "name": "Output Parser (Antwort + Quellen)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2752,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0,
+          "keepAlive": "30m",
+          "numCtx": 8192,
+          "numPredict": 24,
+          "format": "json"
+        }
+      },
+      "id": "84958f95-19cc-45cd-b570-798cf6e71217",
+      "name": "Ollama Chat Model (Faithfulness-Judge)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        3056,
+        592
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      },
+      "notes": "format=json erzwingt strukturierte Ausgabe. In v2 wurde ein freier Text mit parseFloat gelesen - antwortete das Modell 'Die Antwort ist zu 90 % belegt', ergab das NaN und damit ein 'Nicht verifiziert'-Flag auf einer korrekten Antwort (Kap. 4.6.2, Failure Case 5: Vertrauensverlust durch False Negatives)."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Bewerte, ob JEDE faktische Aussage der folgenden Antwort durch den gegebenen Kontext belegt ist.\n\nAntworte AUSSCHLIESSLICH mit einem JSON-Objekt der Form {\"score\": 0.0} mit einem Wert zwischen 0.0 und 1.0 (1.0 = vollstaendig belegt).\n\nKontext:\n{{ ($json.__passed_chunks || []).map(c => c.text).join('\\n\\n') }}\n\nAntwort:\n{{ $json.answer }}"
+      },
+      "id": "0eb13450-0e01-4b40-a94d-107df3d6d766",
+      "name": "Faithfulness-Validator (LLM Chain)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        2976,
+        368
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [5a], Kap. 4.3 [5a]. LLM-as-Judge, approximiert das ISSUP-Token-Prinzip aus Self-RAG ohne Fine-Tuning (Kap. 4.5.2). onError=continue: Faellt der Judge aus, wird verified=null gesetzt - 'nicht bewertet' ist etwas anderes als 'nicht belegt', und der Unterschied ist fuer den Nutzer relevant."
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 5a | Kap. 4.2 [5a]: Score < 0.75 -> Flag 'Nicht verifiziert'.\n//\n// ROBUSTES PARSING (Review P-14): v2 nutzte parseFloat auf freiem Text.\n// v3 versucht JSON, dann eine Zahl-Regex, und setzt bei Misserfolg\n// verified=null statt false.\nconst base = $('Output Parser (Antwort + Quellen)').last().json;\nconst raw = ($json.text || $json.output || '').toString().trim();\n\nlet score = null;\ntry {\n  const parsed = JSON.parse(raw);\n  if (typeof parsed.score === 'number') score = parsed.score;\n} catch (e) {\n  const m = raw.match(/\"score\"\\s*:\\s*([01](?:\\.\\d+)?)/) || raw.match(/\\b([01]\\.\\d+)\\b/);\n  if (m) score = parseFloat(m[0]);\n}\nif (score !== null && (isNaN(score) || score < 0 || score > 1)) score = null;\n\nconst { __passed_chunks, ...clean } = base;\n\nreturn [{ json: { ...clean,\n  faithfulness_score: score,\n  verified: score === null ? null : score >= 0.75,\n  faithfulness_note: score === null\n    ? 'Faithfulness konnte nicht bewertet werden (Judge nicht verfuegbar oder Antwort nicht interpretierbar).'\n    : null,\n  __passed_chunks\n}}];"
+      },
+      "id": "de59b12f-b215-4276-9d44-27fe02319bcc",
+      "name": "Verified-Flag setzen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3328,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/cache/store",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query_original, kind: \"response\", payload: Object.fromEntries(Object.entries($json).filter(([k]) => !k.startsWith(\"__\") && k !== \"latency_ms\" && k !== \"start_ts\")) }) }}",
+        "options": {
+          "timeout": 1500
+        }
+      },
+      "id": "cd4f7aed-eb7c-4885-955b-73257c70cd9f",
+      "name": "CAG Cache speichern",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3552,
+        464
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 3.2.1 Prinzip 4. Nur verifizierte bzw. nicht negativ geflaggte Antworten sind cachewuerdig - die Pruefung erfolgt im nachfolgenden Code-Node. latency_ms und start_ts werden bewusst NICHT mitgecached: Eine Cache-Antwort soll ihre eigene Latenz berichten, nicht die des Erstlaufs."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "e9e065ba-ff96-4053-a4cf-577754876dbf",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        3776,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Auch Nicht-Antworten und Fehler gehoeren ins Protokoll - sonst\n// zeigt die Auswertung ein zu optimistisches Bild, weil ausgerechnet\n// die Problemfaelle fehlen.\nconst r = $json;\nreturn [{ json: { ...r, __telemetry: {\n  request_id: r.request_id,\n  query_class: r.query_class,\n  q_class: r.q_class,\n  activated_paths: r.activated_paths || [],\n  crag_status: r.crag_status || 'error',\n  top_score: r.top_score ?? null,\n  latency_ms: r.latency_ms || 0,\n  verified: false,\n  error: r.fallback_reason || null,\n  warnings: r.retrieval_warnings || []\n}}}];"
+      },
+      "id": "862b10d1-2afa-4288-8b5a-983d9caafcd1",
+      "name": "Fehlerpfad-Telemetrie",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/telemetry/log",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.__telemetry) }}",
+        "options": {
+          "timeout": 1500
+        }
+      },
+      "id": "0f2a023c-6f1e-4e16-ae68-161e6bb84482",
+      "name": "Telemetrie-Log Fehlerpfad (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3328,
+        784
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Fehlerpfad-Telemetrie').last().json;\nconst { __telemetry, start_ts, ...clean } = r;\nreturn [{ json: clean }];"
+      },
+      "id": "9d2e932c-ff59-4867-bf6e-0c0c61c17aad",
+      "name": "Fehlerantwort finalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3552,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "ee573ed1-ae01-4040-9f69-d210d4db2b6c",
+      "name": "Respond: Keine Information",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        3776,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Entfernt interne Felder und setzt die endgueltige Latenz.\n// Die Latenz wird hier gemessen, nicht frueher: Cache-Store und\n// Telemetrie liegen zwar hinter der Antwortlogik, aber vor dem\n// Respond-Node und zaehlen damit zur wahrgenommenen Wartezeit dazu.\n// NACHHER\nconst r = $('Verified-Flag setzen').last().json;\nconst { __passed_chunks, start_ts, query_original, ...clean } = r;\n\nreturn [{ json: { ...clean,\n  latency_ms: Date.now() - (start_ts || Date.now()),\n  nf03_erfuellt: (Date.now() - (start_ts || Date.now())) <= 5000\n}}];"
+      },
+      "id": "56b0ad6a-2b7f-4997-8760-7dcb9eda1262",
+      "name": "Finale Antwort aufbereiten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3552,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCHICHT 5c | Kap. 4.2 [5c]\n// Vollstaendiges Protokoll als Basis der RAGAs-Benchmark-Auswertung\n// (Kap. 4.7.2, Stufe 1). Ohne diese Daten sind die Qualitaetsziele\n// Faithfulness >= 0.78, Context Precision >= 0.74 und E2E <= 5 s nicht\n// nachweisbar - das war neben der fehlenden Laufzeitumgebung der zweite\n// Grund, warum Phase 2b zu Recht nicht als abgeschlossen galt.\nconst r = $('Verified-Flag setzen').last().json;\nconst { __passed_chunks, ...clean } = r;\n\nreturn [{ json: { ...clean, __telemetry: {\n  request_id: r.request_id,\n  query: r.query_original,\n  query_class: r.query_class,\n  q_class: r.q_class,\n  activated_paths: r.activated_paths || [],\n  retrieval_round: r.retrieval_round,\n  retrieval_method: r.retrieval_method,\n  chunk_ids: (r.sources || []).map(s => s.chunk_id),\n  top_score: r.top_score,\n  crag_status: r.crag_status,\n  id_consistency: r.id_consistency,\n  reranked: r.reranked,\n  cache_hit: false,\n  faithfulness_score: r.faithfulness_score,\n  verified: r.verified,\n  latency_ms: Date.now() - (r.start_ts || Date.now()),\n  answer_length: (r.answer || '').length,\n  warnings: r.retrieval_warnings || []\n}}}];"
+      },
+      "id": "e959f7d3-cb45-4dab-8f8c-ee40c3c5182b",
+      "name": "Telemetrie-Datensatz bauen1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3776,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/telemetry/log",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.__telemetry) }}",
+        "options": {
+          "timeout": 1500
+        }
+      },
+      "id": "537fdd14-5eab-40e0-835c-6a34e154e0ab",
+      "name": "Telemetrie-Log (HTTP)1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4000,
+        464
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Kap. 4.2 [5c]. Fire-and-forget mit onError=continue: Telemetrie darf unter keinen Umstaenden eine Antwort verhindern. Ein voller Datentraeger ist ein Betriebsproblem, kein Grund, dem Servicetechniker die Antwort zu verweigern."
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0.1,
+          "keepAlive": "30m",
+          "numCtx": 4096,
+          "numPredict": 15
+        }
+      },
+      "id": "99c05e4b-2f17-4213-81fd-f5617b6fbcc9",
+      "name": "Ollama Chat Model (Klassifikation)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        -3184,
+        1104
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "pPBHQBpjEllY5jZ9",
+          "name": "Ollama account"
+        }
+      },
+      "notes": "keepAlive=30m verhindert den Kaltstart-Modell-Load von 3-8 s vor jeder Anfrage - der billigste Latenzgewinn im gesamten Workflow (NF-03)."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Du bist ein Klassifizierer. Kategorien: produktspezifikation, produktvergleich, produktsuche, preisanfrage, allgemeine_technische_frage.\n\n- produktspezifikation: Nutzer nennt EIN konkretes Produkt und fragt nach Attributwerten.\n- produktvergleich: Nutzer nennt ZWEI+ konkrete Produkte zum Vergleich.\n- produktsuche: Nutzer sucht ein passendes Produkt ohne Produktcode zu nennen.\n- preisanfrage: Frage nach Preis/Kosten/Verfügbarkeit.\n- allgemeine_technische_frage: Restklasse, allgemeine Begriffsfrage.\n\nAntworte NUR mit dem Kategorienamen, ohne Erklärung, ohne Satzzeichen.\n\nAnfrage: {{ $json.query }}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        -3264,
+        880
+      ],
+      "id": "2f71db29-165b-4a7c-9191-6d449142ce3f",
+      "name": "Klassifikation (LLM Chain)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Cache-Ergebnis auswerten').last().json;\nconst raw = ($json.heuristik_klasse || $json.text || $json.output || '').trim().toLowerCase();\nconst valid = ['produktspezifikation','produktvergleich','produktsuche','preisanfrage','allgemeine_technische_frage'];\nconst query_class = valid.find(v => raw.includes(v)) || 'allgemeine_technische_frage';\nreturn [{ json: { ...ctx, query_class } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2912,
+        1008
+      ],
+      "id": "4b0931dc-77b3-41f7-8136-f69abd4cf307",
+      "name": "Klassifikation-Ergebnis parsen"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Schnelle, deterministische Vorklassifikation ohne Ollama-Aufruf.\n// Ziel: Nur absolut eindeutige Fälle direkt filtern, um das LLM zu entlasten.\n// Komplexe, verschachtelte oder allgemeine Fragen werden an das Klassifikations-LLM übergeben.\n\nconst ctx = $json;\nconst rawQuery = ctx.query || '';\nconst text = rawQuery.toLowerCase().trim();\n\n// 1. SMALLTALK & ALLGEMEINES (Systemfragen & freie Anfragen)\n// Bei Begrüßungen, Fragen zum Chatbot oder allgemeinen Themen soll die Heuristik bewusst PASSEN (false),\n// damit dein Ollama-LLM die intelligente Routing-Entscheidung übernimmt.\nconst smalltalkWoerter = [\n  'hallo', 'guten tag', 'moin', 'servus', 'wer bist du', 'was kannst du', \n  'wie funktioniert', 'chatbot', 'hilfe', 'wer hat dich'\n];\n\nif (smalltalkWoerter.some(w => text.includes(w))) {\n  return [{ json: { ...ctx, heuristik_klasse: null, heuristik_sicher: false } }];\n}\n\n// 2. ERWEITERTE PREIS-SIGNALWÖRTER (Kauf- & Kostenanfragen)\n// Wenn Schlüsselwörter wie \"teuer\", \"kosten\" oder \"listenpreis\" fallen, ist die Absicht eindeutig.\nconst preisWoerter = [\n  'preis', 'kosten', 'kostet', 'teuer', '€', 'eur', 'listenpreis', 'angebot', 'kaufen'\n];\n\nif (preisWoerter.some(w => text.includes(w))) {\n  return [{ json: { ...ctx, heuristik_klasse: 'preisanfrage', heuristik_sicher: true } }];\n}\n\n// 3. PRODUKTSUCHE-SIGNALWÖRTER (Empfehlungs- & Eignungsfragen)\n// Fängt Phrasen wie \"Ich brauche...\" oder \"Welche Klemmen eignen sich für ATEX...\" ab.\nconst sucheWoerter = [\n  'suche', 'brauche', 'empfehl', 'geeignet für', 'geeignet fuer', \n  'welches produkt', 'welche klemme', 'welches modul', 'welche weidmüller', 'welche weidmueller'\n];\n\nconst vergleichsWoerter = [\n  'vergleiche', 'unterschied', 'gegenüberstellung', 'gegenueberstellung', 'vs', 'besser als', 'unterscheiden'\n];\n\n// Suche hat Vorrang vor Produktzählungen, solange kein expliziter Vergleich gefordert wird\nif (sucheWoerter.some(w => text.includes(w)) && !vergleichsWoerter.some(w => text.includes(w))) {\n  return [{ json: { ...ctx, heuristik_klasse: 'produktsuche', heuristik_sicher: true } }];\n}\n\n// 4. STRIP UND PRODUKT-REGEX (Strikt beschränkte Mustersuche)\n// Ausschlussliste für Begriffe, die sonst fälschlicherweise als Produktcode gezählt würden\nconst NON_PRODUCT_EXACT = [\n  'IO-LINK', 'IOLINK', 'PROFINET', 'ETHERCAT', 'MODBUS', \n  'IP67', 'IP20', 'IP65', 'IP68', 'ATEX', 'DIN', 'ISO', \n  'EN', 'IEC', 'E/A-MODUL', 'EA-MODUL', 'E/A', 'MODUL', 'KLEMME', 'STECKER', 'ARTIKEL'\n];\n\n// Echte Produktmuster: Nur noch präzise Materialnummern oder Produkttypen\nconst PRODUCT_PATTERNS = [\n  /\\b\\d{10}\\b/g,                        // 10-stellige Materialnummern (z. B. 1020000000)\n  /\\b[A-Z]{2,4}\\s?\\d{1,2}\\.\\d{1,2}\\b/gi, // Bezeichnungen mit Punkt (z. B. WDU 2.5)\n  /\\b[A-Z]{2,4}\\s?\\d{1,3}\\b/gi           // Standardbezeichnungen (z. B. WDU 4)\n];\n\nlet produkte = new Set();\nfor (const p of PRODUCT_PATTERNS) {\n  for (const m of rawQuery.matchAll(p)) {\n    const candidate = m[0].toUpperCase().trim();\n    if (!NON_PRODUCT_EXACT.includes(candidate)) {\n      produkte.add(candidate);\n    }\n  }\n}\n\nconst n_produkte = produkte.size;\n\n// Eigenschafts-Signalwörter für Einzelprodukte\nconst attributWoerter = [\n  'welchen', 'welcher', 'welches', 'wie hoch', 'wie viel', 'leiterquerschnitt', \n  'spannung', 'strom', 'schutzart', 'nennstrom', 'abmessung', 'gewicht', \n  'farbe', 'werkstoff', 'datenblatt', 'daten', 'spezifikation'\n];\n\n// 5. FINALES ROUTING UND PRIORISIERUNG\nlet klasse = null;\n\nif (vergleichsWoerter.some(w => text.includes(w))) {\n  // Echter Vergleich durch explizites Signalwort (z. B. \"Unterschied\")\n  klasse = 'produktvergleich';\n} else if (n_produkte >= 2) {\n  // Bei >= 2 Produkten: Wenn ein Attributwort dabei ist (\"Welchen Querschnitt haben X und Y\"), \n  // ist es eher eine Spezifikationsfrage; sonst ein Produktvergleich.\n  klasse = attributWoerter.some(w => text.includes(w)) ? 'produktspezifikation' : 'produktvergleich';\n} else if (n_produkte === 1 || attributWoerter.some(w => text.includes(w))) {\n  // Genau 1 Produkt ODER klare Attributfrage -> Produktspezifikation (Q1)\n  klasse = 'produktspezifikation';\n}\n\n// RÜCKGABE:\n// - Ist klasse null -> heuristik_sicher: false -> Workflow leitet an Ollama-LLM weiter\n// - Ist klasse zugewiesen -> heuristik_sicher: true -> Direktes Routing im Workflow\nreturn [{ json: { ...ctx, heuristik_klasse: klasse, heuristik_sicher: klasse !== null } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3712,
+        1008
+      ],
+      "id": "614db890-5852-417b-95db-fdb3acac3100",
+      "name": "Heuristische Vorklassifikation"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "22f5f476-0a7f-4843-8576-b1971f30b37d",
+              "leftValue": "={{ $json.heuristik_sicher }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3488,
+        1008
+      ],
+      "id": "94fd0729-78c3-4831-b916-4491da8ee042",
+      "name": "Heuristik sicher?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "89214945-bf09-4afa-9abe-2b2cd4c0b443",
+              "leftValue": "={{ String($json.verified) }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3392,
+        624
+      ],
+      "id": "c810a6bd-14eb-4f1f-a2f4-530e98e630bd",
+      "name": "Antwort verifiziert?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PETRA_API_BASE || 'http://ingestion-api:8001' }}/product/retrieve",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query_original, products: $json.candidate_products || [], top_k: 8 }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "9ef32367-34db-47e2-a05f-bc8f1d7cd3e6",
+      "name": "Produkt-Retrieval (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1296,
+        1360
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "s2 / Kap. 4.7.2 Stufe 2 (Graph-Metadaten-Layer als JSON-Lexikon): Produktname -> Artikelnummer -> Dense-Suche nur im Datenblatt dieses Produkts."
+    },
+    {
+      "parameters": {
+        "jsCode": "// s2 (Lexikon-Pfad) | Produkt-Retrieval normalisieren (gleiches Format wie BM25).\n// /product/retrieve loest Produktnamen ueber das Produkt-Lexikon in\n// Artikelnummern auf und sucht NUR in deren Datenblatt-Chunks.\n// Bei Ausfall (onError=continue) entsteht eine leere, wohlgeformte Liste.\nconst input = $input.first().json || {};\nconst hits = Array.isArray(input.results) ? input.results : [];\nconst normalized = hits.map((hit, index) => ({\n  chunk_id: hit.chunk_id ?? `prod-${index}`,\n  text: typeof hit.text === 'string' ? hit.text : '',\n  metadata: hit.metadata ?? {},\n  score: Number(hit.score ?? 0),\n  rank: Number(hit.rank ?? index + 1)\n}));\nreturn [{ json: {\n  retrieval_source: 'product',\n  results: normalized,\n  count: normalized.length,\n  resolved_artikelnummern: Array.isArray(input.artikelnummern) ? input.artikelnummern : [],\n  produkt_info: Array.isArray(input.produkt_info) ? input.produkt_info : [],\n  produkt_exakt: input.exakt === true,\n  warning: input.warning || null\n}}];"
+      },
+      "id": "2f6dc4fd-b28f-4c3a-879e-cc83b0c29fe4",
+      "name": "Produkt-Treffer normalisieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        1312
+      ],
+      "alwaysOutputData": true
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: /petra-query": {
+      "main": [
+        [
+          {
+            "node": "Input normalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input normalisieren": {
+      "main": [
+        [
+          {
+            "node": "IF: Eingabe gueltig?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Eingabe gueltig?": {
+      "main": [
+        [
+          {
+            "node": "IF: Sprache unterstuetzt?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fehlerantwort: ungueltige Eingabe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fehlerantwort: ungueltige Eingabe": {
+      "main": [
+        [
+          {
+            "node": "Respond: Eingabefehler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Sprache unterstuetzt?": {
+      "main": [
+        [
+          {
+            "node": "CAG Cache-Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fehlerantwort: Sprache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fehlerantwort: Sprache": {
+      "main": [
+        [
+          {
+            "node": "Respond: Eingabefehler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CAG Cache-Lookup": {
+      "main": [
+        [
+          {
+            "node": "Cache-Ergebnis auswerten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache-Ergebnis auswerten": {
+      "main": [
+        [
+          {
+            "node": "IF: Cache-Hit?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Cache-Hit?": {
+      "main": [
+        [
+          {
+            "node": "Cache-Antwort aufbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Heuristische Vorklassifikation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache-Antwort aufbereiten": {
+      "main": [
+        [
+          {
+            "node": "Respond: Cache-Treffer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing & Produktextraktion": {
+      "main": [
+        [
+          {
+            "node": "Retrieval-Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieval-Start": {
+      "main": [
+        [
+          {
+            "node": "IF: HyDE aktiv?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model (HyDE)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "HyDE Query-Expansion (LLM Chain)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: HyDE aktiv?": {
+      "main": [
+        [
+          {
+            "node": "HyDE Query-Expansion (LLM Chain)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Switch: Retrieval-Pfade",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HyDE Query-Expansion (LLM Chain)": {
+      "main": [
+        [
+          {
+            "node": "HyDE uebernehmen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HyDE uebernehmen": {
+      "main": [
+        [
+          {
+            "node": "Switch: Retrieval-Pfade",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Embeddings": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Chroma Dense Retrieval",
+            "type": "ai_embedding",
+            "index": 0
+          },
+          {
+            "node": "Chroma TAG Tabellen-Index",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch: Retrieval-Pfade": {
+      "main": [
+        [
+          {
+            "node": "Agentic: Preis-Recherche (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chroma Dense Retrieval",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BM25 Sparse Retrieval (HTTP)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Chroma TAG Tabellen-Index",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Produkt-Retrieval (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chroma Dense Retrieval",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BM25 Sparse Retrieval (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chroma Dense Retrieval",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BM25 Sparse Retrieval (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chroma Dense Retrieval": {
+      "main": [
+        [
+          {
+            "node": "Dense-Treffer normalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BM25 Sparse Retrieval (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "BM25-Treffer normalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chroma TAG Tabellen-Index": {
+      "main": [
+        [
+          {
+            "node": "TAG-Treffer normalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dense-Treffer normalisieren": {
+      "main": [
+        [
+          {
+            "node": "Merge Retrieval-Ergebnisse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BM25-Treffer normalisieren": {
+      "main": [
+        [
+          {
+            "node": "Merge Retrieval-Ergebnisse",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "TAG-Treffer normalisieren": {
+      "main": [
+        [
+          {
+            "node": "Merge Retrieval-Ergebnisse",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge Retrieval-Ergebnisse": {
+      "main": [
+        [
+          {
+            "node": "Retrieval zusammenfassen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieval zusammenfassen": {
+      "main": [
+        [
+          {
+            "node": "RRF Fusion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RRF Fusion": {
+      "main": [
+        [
+          {
+            "node": "Cross-Encoder Reranking (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cross-Encoder Reranking (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Reranking uebernehmen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reranking uebernehmen": {
+      "main": [
+        [
+          {
+            "node": "CRAG-Score-Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CRAG-Score-Filter": {
+      "main": [
+        [
+          {
+            "node": "IF: Kontext ausreichend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Kontext ausreichend?": {
+      "main": [
+        [
+          {
+            "node": "IF: Produktvergleich?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF: Query-Rewrite noetig?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model (Rewrite)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Query-Rewriting (LLM Chain)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Query-Rewrite noetig?": {
+      "main": [
+        [
+          {
+            "node": "Query-Rewriting (LLM Chain)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Kontrollierte 'Ich weiss es nicht'-Antwort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query-Rewriting (LLM Chain)": {
+      "main": [
+        [
+          {
+            "node": "Runde 2 vorbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rewrite fehlgeschlagen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runde 2 vorbereiten": {
+      "main": [
+        [
+          {
+            "node": "Retrieval-Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rewrite fehlgeschlagen": {
+      "main": [
+        [
+          {
+            "node": "Kontrollierte 'Ich weiss es nicht'-Antwort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agentic: Preis-Recherche (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Agent-Kontext uebernehmen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent-Kontext uebernehmen": {
+      "main": [
+        [
+          {
+            "node": "IF: Agent-Kontext vorhanden?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Agent-Kontext vorhanden?": {
+      "main": [
+        [
+          {
+            "node": "Prompt-Komposition (Token-Budget)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Kontrollierte 'Ich weiss es nicht'-Antwort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Produktvergleich?": {
+      "main": [
+        [
+          {
+            "node": "UC-02 Dual-Retrieval (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prompt-Komposition (Token-Budget)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UC-02 Dual-Retrieval (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Produkt-Chunks gruppieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Produkt-Chunks gruppieren": {
+      "main": [
+        [
+          {
+            "node": "UC-03 Differenzmatrix (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UC-03 Differenzmatrix (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Vergleichskontext aufbereiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vergleichskontext aufbereiten": {
+      "main": [
+        [
+          {
+            "node": "Prompt-Komposition (Token-Budget)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model (Generierung)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Generierung (LLM Chain)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt-Komposition (Token-Budget)": {
+      "main": [
+        [
+          {
+            "node": "Generierung (LLM Chain)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generierung (LLM Chain)": {
+      "main": [
+        [
+          {
+            "node": "Output Parser (Antwort + Quellen)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fehlerantwort: Generierung",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model (Faithfulness-Judge)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Faithfulness-Validator (LLM Chain)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Output Parser (Antwort + Quellen)": {
+      "main": [
+        [
+          {
+            "node": "Faithfulness-Validator (LLM Chain)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Faithfulness-Validator (LLM Chain)": {
+      "main": [
+        [
+          {
+            "node": "Verified-Flag setzen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verified-Flag setzen": {
+      "main": [
+        [
+          {
+            "node": "Finale Antwort aufbereiten",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Antwort verifiziert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CAG Cache speichern": {
+      "main": [
+        [
+          {
+            "node": "Telemetrie-Datensatz bauen1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kontrollierte 'Ich weiss es nicht'-Antwort": {
+      "main": [
+        [
+          {
+            "node": "Fehlerpfad-Telemetrie",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fehlerantwort: Generierung": {
+      "main": [
+        [
+          {
+            "node": "Fehlerpfad-Telemetrie",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fehlerpfad-Telemetrie": {
+      "main": [
+        [
+          {
+            "node": "Telemetrie-Log Fehlerpfad (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telemetrie-Log Fehlerpfad (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Fehlerantwort finalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fehlerantwort finalisieren": {
+      "main": [
+        [
+          {
+            "node": "Respond: Keine Information",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telemetrie-Datensatz bauen1": {
+      "main": [
+        [
+          {
+            "node": "Telemetrie-Log (HTTP)1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telemetrie-Log (HTTP)1": {
+      "main": [
+        []
+      ]
+    },
+    "Finale Antwort aufbereiten": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model (Klassifikation)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Klassifikation (LLM Chain)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Klassifikation (LLM Chain)": {
+      "main": [
+        [
+          {
+            "node": "Klassifikation-Ergebnis parsen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Klassifikation-Ergebnis parsen": {
+      "main": [
+        [
+          {
+            "node": "Routing & Produktextraktion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Heuristische Vorklassifikation": {
+      "main": [
+        [
+          {
+            "node": "Heuristik sicher?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Heuristik sicher?": {
+      "main": [
+        [
+          {
+            "node": "Klassifikation-Ergebnis parsen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Klassifikation (LLM Chain)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Antwort verifiziert?": {
+      "main": [
+        [
+          {
+            "node": "CAG Cache speichern",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telemetrie-Datensatz bauen1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Produkt-Retrieval (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Produkt-Treffer normalisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Produkt-Treffer normalisieren": {
+      "main": [
+        [
+          {
+            "node": "Merge Retrieval-Ergebnisse",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "e4c0ca3f-3819-47eb-ab7f-fadc3e994bec",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3783276150787d6cc7d2c15afaddcfc567e54a9edd55af95efd22e036342d216"
+  },
+  "nodeGroups": [],
+  "id": "0Z213CxZRRJaLfUz",
+  "tags": []
+}

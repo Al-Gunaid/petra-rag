@@ -1,0 +1,14 @@
+# PETRA-RAG Frontend v1 — Basistheme (industriell, hell, Petrol-Akzent)
+[theme]
+primaryColor = "#0F766E"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#EEF2F6"
+textColor = "#0F172A"
+font = "sans serif"
+
+[server]
+address = "127.0.0.1"   # NF-11: nur localhost
+headless = true
+
+[browser]
+gatherUsageStats = false   # NF-01: keine Telemetrie

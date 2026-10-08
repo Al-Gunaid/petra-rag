@@ -1,0 +1,28 @@
+{
+  "remove_exact": [
+    "Weidmüller Interface GmbH & Co. KG",
+    "Klingenbergstraße 26",
+    "D-32758 Detmold",
+    "Germany",
+    "www.weidmueller.com",
+    "Katalogstand / Zeichnungen"
+  ],
+  "remove_patterns": [
+    "^Erstellungs-Datum\\b.*$",
+    "^\\d{1,4}$"
+  ],
+  "keep_exact": [
+    "Datenblatt",
+    "Technische Daten",
+    "Produktbeschreibung",
+    "Allgemeine Bestelldaten"
+  ],
+  "keep_patterns": [
+    "^Best\\.-Nr\\.?$",
+    "^Bestellnummer$",
+    "^GTIN(?: \\(EAN\\))?$",
+    "^Art$",
+    "^Artikelnummer$"
+  ]
+}
+

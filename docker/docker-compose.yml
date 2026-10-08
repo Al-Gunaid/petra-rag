@@ -1,0 +1,281 @@
+# ============================================================================
+# PETRA-RAG — docker-compose.yml
+# ----------------------------------------------------------------------------
+# Lokales Deployment gemäß Spezifikation Anhang A.2
+# Stand: Phase 3 (Workflow v3.0, Hybrid-Retrieval mit RRF-Fusion)
+#
+# Erfüllte nicht-funktionale Anforderungen:
+#   NF-01  Kein Cloud-Telemetrie-Versand (ANONYMIZED_TELEMETRY=False)
+#   NF-02  Modell-Caches persistent (HuggingFace- und HF_HOME-Volumes)
+#   NF-11  Alle Ports ausschließlich an 127.0.0.1 gebunden
+#   NF-12  Einmalige Installation <= 30 Minuten
+#
+# ----------------------------------------------------------------------------
+# PORT-ÜBERSICHT (wichtig für alle curl-Aufrufe aus MIGRATION.md!)
+#
+#   8000  ChromaDB          -> Vektordatenbank
+#   8001  Ingestion-API     -> FastAPI: /query, /retrieval/bm25, /ops/health/deep
+#   5678  n8n               -> Workflow-Engine
+#   8501  Frontend          -> Streamlit-UI
+#  11434  Ollama            -> LLM- und Embedding-Server
+#
+# ----------------------------------------------------------------------------
+# START
+#   docker compose up -d
+#   docker compose ps
+#   curl -s http://localhost:8001/ops/health/deep | python3 -m json.tool
+#
+# Erwartung: "ok": true. Dieser Aufruf gehört vor jeden ersten Request
+
+
+services:
+
+  # ── ChromaDB Vektordatenbank ──────────────────────────────
+  chromadb:
+      image: chromadb/chroma:latest      
+      container_name: petra-chromadb
+      ports:
+        - "127.0.0.1:8000:8000"          # NF-11: nur localhost
+      volumes:
+        - /mnt/petra-rag/chroma_db:/data # Persistenz der Vektordaten
+      environment:
+        - CHROMA_COLLECTION_TEXT=petra_text_chunks
+        - CHROMA_COLLECTION_TAG=petra_tag_chunks
+        - ANONYMIZED_TELEMETRY=False        # NF-01: kein Cloud-Telemetrie
+      ulimits:
+        nofile:                           # viele offene Segmentdateien bei
+          soft: 65536                    # großen Collections (>600k Chunks)
+          hard: 65536
+          
+      restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Ollama — Modellserver für LLM und Embeddings
+  # ══════════════════════════════════════════════════════════════════════════
+  # Benötigte Modelle (einmalig nach dem ersten Start ziehen):
+  #   docker compose exec ollama ollama pull llama3.1:8b
+  #   docker compose exec ollama ollama pull bge-m3:latest
+  #
+  # /ops/health/deep meldet fehlende Modelle mit dem passenden
+  # ollama-pull-Befehl als Behebungshinweis.
+  # ══════════════════════════════════════════════════════════════════════════
+  ollama:
+    image: ollama/ollama:latest        
+    container_name: petra_ollama
+    environment:
+    - OLLAMA_NUM_PARALLEL=1
+    - OLLAMA_MAX_QUEUE=8
+    - OLLAMA_MAX_LOADED_MODELS=2
+    - OLLAMA_KEEP_ALIVE=30m
+    - OLLAMA_FLASH_ATTENTION=1
+    gpus: all                          # LLM-Inferenz auf der GPU
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - /mnt/petra-rag/ollama:/root/.ollama   # Modellgewichte persistent
+    restart: unless-stopped
+ 
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # Ingestion-API — FastAPI-Backend (Ingestion + Retrieval + Query)
+  # ══════════════════════════════════════════════════════════════════════════
+  # WICHTIG — Servicename:
+  # Der Service MUSS "ingestion-api" heißen. Auf diesen Namen verweisen:
+  #   - depends_on bei n8n und frontend
+  #   - PETRA_API_URL im Frontend
+  #   - PETRA_API_BASE in n8n
+  #
+  # Der Anwendungscode wird über "COPY data/src /app/src" ins Image gebaut,
+  # NICHT gemountet. Nach jeder Codeänderung auf dem Host ist deshalb ein
+  # Rebuild nötig:
+  #   docker compose build ingestion-api && docker compose up -d ingestion-api
+  # ══════════════════════════════════════════════════════════════════════════
+  ingestion-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: backend
+    container_name: petra_ingestion
+    gpus: all                          # Embedding-Erzeugung + Cross-Encoder
+    ports:
+      - "127.0.0.1:8001:8001"     # NF-11: nur localhost
+    volumes:
+      - /mnt/petra-rag:/data              # PDF-Eingang, ChromaDB, Logs
+      - ~/.cache/huggingface:/root/.cache/huggingface  # Modell-Cache (NF-02)
+    environment:
+      # ── Ingestion ───────────────────────────────────────────────────────
+      - MODEL_NAME=${MODEL_NAME:-BAAI/bge-m3}           # FA-ING-08
+      - WATCH_FOLDER=/data/pdfs
+      - HASH_FOLDER=/data/processed/hashes
+      - REPORT_DIR=/data/processed
+      - UPSERT_MODE=${UPSERT_MODE:-always}              # FA-ING-11
+      - OCR_LANG=${OCR_LANG:-deu+eng}
+      - OCR_DPI=${OCR_DPI:-300}
+ 
+      # ── ChromaDB-Anbindung ──────────────────────────────────────────────
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - CHROMA_PERSIST_DIR=/data/chroma_db
+      - CHROMA_BATCH_SIZE=${CHROMA_BATCH_SIZE:-250}
+      - STATUS_BATCH_SIZE=${STATUS_BATCH_SIZE:-500}
+      - CHROMA_MAX_RETRIES=${CHROMA_MAX_RETRIES:-3}
+      - CHROMA_COLLECTION_TEXT=petra_text_chunks_v2
+      # ── Vorverarbeitung ─────────────────────────────────────────────────
+      - HEADER_FOOTER_MODE=clean
+      - HEADER_FOOTER_MIN_PAGES=2
+      - HEADER_FOOTER_RULES_PATH=/app/src/pipeline/header_footer_rules.json
+      - TABLE_FILTER_MODE=clean
+      - TABLE_CLEAN_MODE=analyze
+ 
+      # ── Dienst-Endpunkte ────────────────────────────────────────────────
+      - PETRA_N8N_QUERY_WEBHOOK_URL=http://n8n:5678/webhook/petra-query
+      - PETRA_N8N_TIMEOUT=150
+      - PETRA_OLLAMA_URL=http://ollama:11434
+      - PETRA_CHROMA_URL=http://chromadb:8000
+ 
+      # ── Modelle ─────────────────────────────────────────────────────────
+      # Der Bestand ist mit bge-m3 indexiert — nachgewiesen über die
+      # Embedding-Dimension 1024 der vorhandenen Chunks.
+      # Ein Wechsel würde eine vollständige Neu-Einbettung erzwingen.
+      - PETRA_LLM_MODEL=${PETRA_LLM_MODEL:-llama3.1:8b}
+      - PETRA_EMBEDDING_MODEL=${PETRA_EMBEDDING_MODEL:-bge-m3:latest}
+ 
+      # ── Retrieval / Fusion ──────────────────────────────────────────────
+      # PETRA_CHROMA_SCORE_SPACE steht auf "auto" (Heuristik). Nach der
+      # ersten Telemetrie-Auswertung explizit setzen. Ein falsch interpretierter Score-Raum invertiert die
+      # Vergleichsrichtung des CRAG-Filters, der dann systematisch die
+      # schlechtesten Chunks passieren lässt — ohne sichtbaren Fehler.
+      - PETRA_CHROMA_SCORE_SPACE=${PETRA_CHROMA_SCORE_SPACE:-auto}
+      - PETRA_BM25_INDEX_PATH=/data/bm25_index.jsonl
+ 
+      # ── CAG-Cache (Schicht 1c) ──────────────────────────────────────────
+      - PETRA_CACHE_ENABLED=${PETRA_CACHE_ENABLED:-true}
+      - PETRA_CACHE_PATH=/data/cag_cache.json
+      - PETRA_CACHE_TTL_SECONDS=${PETRA_CACHE_TTL_SECONDS:-86400}
+ 
+      # ── Cross-Encoder-Reranking (Schicht 3c) ────────────────────────────
+      # Bei knappem VRAM abschaltbar. Die Pipeline läuft dann mit der
+      # RRF-Reihenfolge weiter — degradiert, nicht fehlerhaft.
+      - PETRA_RERANKER_ENABLED=${PETRA_RERANKER_ENABLED:-true}
+      - PETRA_RERANKER_MODEL=${PETRA_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+ 
+      # ── Agentic Extension (Schicht 6) ───────────────────────────────────
+      # Default aus (Offline-First, NF-01/NF-02). Bei false liefert der
+      # Q4-Pfad eine kontrollierte Meldung statt eines veralteten Preises.
+      - PETRA_WEB_AGENT_ENABLED=${PETRA_WEB_AGENT_ENABLED:-true}
+ 
+      # ── Telemetrie (Schicht 5c) ─────────────────────────────────────────
+      - PETRA_TELEMETRY_ENABLED=${PETRA_TELEMETRY_ENABLED:-true}
+      - PETRA_TELEMETRY_PATH=/data/telemetry.jsonl
+ 
+      # ── Modell-Cache für sentence-transformers ──────────────────────────
+      # Ohne persistentes HF_HOME lädt sentence-transformers das
+      # Cross-Encoder-Modell bei jedem Containerstart neu — im
+      # Offline-Betrieb schlägt das fehl (Defekt P3).
+      # Einmaliges Vorladen nach dem ersten Start (MIGRATION.md, Schritt 2):
+      #   docker compose exec ingestion-api python -c \
+      #     "from sentence_transformers import CrossEncoder; \
+      #      CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+      # Danach kann TRANSFORMERS_OFFLINE=1 gesetzt werden.
+      - HF_HOME=/data/hf_cache
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+ 
+    depends_on:
+      - chromadb
+      - ollama
+      # KEIN depends_on: n8n — n8n hängt seinerseits von ingestion-api ab.
+      # Ein gegenseitiger Eintrag ergäbe einen Zyklus, den Compose ablehnt.
+      # Der n8n-Webhook wird ohnehin erst zur Laufzeit aufgerufen.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    restart: unless-stopped
+ 
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # n8n — Workflow-Automatisierung (RAG-Orchestrierung)
+  # ══════════════════════════════════════════════════════════════════════════
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: petra_n8n
+    gpus: all
+    ports:
+      - "127.0.0.1:5678:5678"     # NF-11: nur localhost
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./data:/data
+      - ../n8n_workflows:/workflows    # Import-/Exportpfad (Schritt 0 und 7)
+    environment:
+      # ── Authentifizierung ───────────────────────────────────────────────
+
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}   # Pflicht via .env (NF-11)
+ 
+      # ── Zugriff auf Umgebungsvariablen in Function-Nodes ────────────────
+
+      # Ohne diese Variable liefern ALLE $env-Ausdrücke im Workflow
+      # "undefined". Der Workflow läuft dann mit seinen Defaults weiter,
+      # die zentrale Konfiguration greift aber nicht — und die Abweichung
+      # fällt erst auf, wenn jemand .env ändert und sich nichts tut.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+ 
+      # ── Backend-Endpunkt ────────────────────────────────────────────────
+      # PETRA_API_BASE muss auf den Service zeigen, der /retrieval/bm25
+      # bereitstellt (MIGRATION.md, Schritt 3b) — also Port 8001.
+      - PETRA_API_BASE=http://ingestion-api:8001
+ 
+      # ── Laufzeit ────────────────────────────────────────────────────────
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - N8N_LOG_LEVEL=info
+ 
+      # ── Modelle ─────────────────────────────────────────────────────────
+      # Identische Defaults wie bei ingestion-api — sonst weichen die
+      # Modellnamen auseinander, sobald .env fehlt.
+      - PETRA_OLLAMA_URL=${PETRA_OLLAMA_URL:-http://ollama:11434}
+      - PETRA_LLM_MODEL=${PETRA_LLM_MODEL:-llama3.1:8b}
+      - PETRA_EMBEDDING_MODEL=${PETRA_EMBEDDING_MODEL:-bge-m3:latest}
+    depends_on:
+      - ingestion-api
+      - chromadb
+      - ollama
+    restart: unless-stopped
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # Frontend — Streamlit-UI (Phase 2a)
+  # ══════════════════════════════════════════════════════════════════════════
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: frontend
+    container_name: petra_frontend
+    gpus: all
+    ports:
+      - "127.0.0.1:8501:8501"     # NF-11: nur localhost
+    volumes:
+      # ERGÄNZT (siehe ANALYSE.md, Frontend-Weiterentwicklung):
+      # Ermöglicht den PDF-Direktupload aus der Streamlit-Oberfläche. Das
+      # Frontend schreibt hochgeladene Dateien in denselben Watch-Folder
+      # (/data/pdfs), den ingestion-api bereits überwacht (UC-05) — es
+      # wird also kein neuer Upload-Mechanismus eingeführt, sondern der
+      # bestehende wiederverwendet. Derselbe Host-Pfad wie bei
+      # ingestion-api, damit beide Container dieselben Dateien sehen.
+      - /mnt/petra-rag:/data
+    environment:
+      # Im Docker-Netzwerk auf Service-Namen statt 127.0.0.1 zeigen
+      # (config.py liest diese ENV-Variablen; Default bleibt 127.0.0.1
+      # für den lokalen Start ohne Docker unverändert bestehen)
+      - PETRA_API_URL=http://ingestion-api:8001
+      - PETRA_CHROMA_URL=http://chromadb:8000
+      - PETRA_N8N_URL=http://n8n:5678
+      # # Ollama ist über den Docker-Servicenamen erreichbar.
+      - PETRA_OLLAMA_URL=${PETRA_OLLAMA_URL:-http://ollama:11434}    
+    depends_on:
+      - ingestion-api
+      - chromadb
+      - n8n
+      - ollama
+    restart: unless-stopped

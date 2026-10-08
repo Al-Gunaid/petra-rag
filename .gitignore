@@ -1,0 +1,43 @@
+# Geheimnisse
+docker/.env
+*.env
+!docker/.env.example
+
+# n8n-Daten (Konto, Credentials, Ausführungen)
+docker/n8n_data/
+n8n_data/
+
+# Daten – werden über Sciebo geteilt
+*.pdf
+!README.pdf
+chroma_db/
+processed/
+pdfs/
+hf_cache/
+ollama/
+*.jsonl
+*.sqlite3
+*.bin
+*.safetensors
+*.gguf
+
+# Evaluationsergebnisse (Sciebo); Testset und Vergleichsdatei bleiben im Repo
+evaluation/**/*.xlsx
+!evaluation/testset/*.xlsx
+!evaluation/baseline/*.xlsx
+eval_*.xlsx
+
+# Sicherungen der Patches
+*.bak
+*.bak_*
+
+# Python / Editor / System
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+*.log

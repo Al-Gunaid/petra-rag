@@ -1,0 +1,669 @@
+{
+  "id": "kZYOKinSgy2vXqlI",
+  "name": "PDF-Pipline-Parsing",
+  "description": null,
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f6b03c23-b180-434c-b660-415abdb68d95",
+              "leftValue": "={{ $json.neu }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1040,
+        224
+      ],
+      "id": "d9fbba71-2b79-431b-9d0b-6118fe484418",
+      "name": "🔍 Neue PDFs vorhanden?"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    status: \"⚠️ Keine neuen PDFs\",\n    hinweis: \"Bitte PDFs in ~/petra-rag/data/pdfs/ ablegen\",\n    zeitstempel: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1072,
+        448
+      ],
+      "id": "3dfe1a03-a725-418d-a2ea-405e5d759ec8",
+      "name": "Keine neuen PDFs"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gesamtergebnis von List_pdfs lesen\nconst data = $input.first().json;\n\n// Maximale Zahl der PDFs pro Workflow-Lauf\nconst LIMIT = 1200;\n\n// Nur neue und gültige PDFs übernehmen.\n// Große PDFs bleiben enthalten, weil sie valid=true haben.\nconst neuePdfDateien = (data.pdfs ?? [])\n  .filter((pdf) => {\n    return pdf.neu === true && pdf.valid === true;\n  })\n  .slice(0, LIMIT);\n\n// Jede PDF wird zu einem eigenen n8n-Item.\nreturn neuePdfDateien.map((pdf) => ({\n  json: pdf,\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -688,
+        208
+      ],
+      "id": "30dcb44b-c345-4047-a1c0-343852b1b44e",
+      "name": "📋 Neue PDFs aufteilen"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://ingestion-api:8001/extract/{{ $json.filename }}",
+        "options": {
+          "timeout": 1800000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -208,
+        96
+      ],
+      "id": "88cda832-1db9-4deb-9d63-56d864b88315",
+      "name": "📄 PyMuPDF: Text + Tabellen",
+      "executeOnce": true,
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "0bc975af-8434-422e-821d-437972767443",
+              "leftValue": "={{ $json.needs_ocr }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": "=",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -16,
+        96
+      ],
+      "id": "6b49dc4d-49ee-4838-af0e-3fdd38616a38",
+      "name": "🔎 Kein Text → OCR nötig?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://ingestion-api:8001/ocr/{{ $json.filename }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  page_numbers: $json.scanned_page_numbers\n} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        208,
+        0
+      ],
+      "id": "190994d5-ade9-4b7e-93c3-969bb8906885",
+      "name": "🔡 Tesseract OCR"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        224
+      ],
+      "id": "0f70e044-d79a-4dfa-8517-bbbf29eb39a5",
+      "name": "✅ Text OK (kein OCR)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const extracted =\n  $('📄 PyMuPDF: Text + Tabellen').item.json;\n\nconst ocrResult =\n  $('🔡 Tesseract OCR').item.json;\n\nconst ocrChunks = Array.isArray(ocrResult.chunks)\n  ? ocrResult.chunks.filter(chunk => chunk.type === 'ocr')\n  : [];\n\nconst processedPages = Array.isArray(ocrResult.processed_pages)\n  ? ocrResult.processed_pages.map(Number)\n  : [];\n\nconst ocrPages = new Set(processedPages);\n\nconst normalChunks = Array.isArray(extracted.chunks)\n  ? extracted.chunks.filter(chunk => {\n      return !(\n        chunk.type === 'text' &&\n        ocrPages.has(Number(chunk.page))\n      );\n    })\n  : [];\n\nreturn [{\n  json: {\n    ...extracted,\n    requested_ocr_pages:\n      ocrResult.requested_pages ?? [],\n    processed_ocr_pages:\n      processedPages,\n    ocr_blocks:\n      ocrChunks.length,\n    low_confidence_pages:\n      ocrResult.low_confidence_pages ?? [],\n    failed_ocr_pages:\n      ocrResult.failed_pages ?? [],\n    chunks: [\n      ...normalChunks,\n      ...ocrChunks,\n    ],\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ],
+      "id": "9db7f420-8d08-43b5-afb9-5f542ed6caa3",
+      "name": "🔗 Ergebnisse zusammenführen"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ingestion-api:8001/chunk",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  chunks: $json.chunks,\n  filename: $json.filename\n} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        672,
+        0
+      ],
+      "id": "8de72325-99bf-4128-ad38-5b9db06c27ff",
+      "name": "✂️ LangChain Chunking"
+    },
+    {
+      "parameters": {
+        "url": "http://ingestion-api:8001/status-summary",
+        "options": {
+          "timeout": 1800000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        448,
+        -192
+      ],
+      "id": "feff3908-709c-4e81-996f-23ed14cabe28",
+      "name": "📊 ChromaDB Status",
+      "retryOnFail": false,
+      "waitBetweenTries": 5000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const csv    = $('CSV Export').first().json;\nconst status = $('📊 ChromaDB Status').first().json;\nreturn [{\n  json: {\n    \"✅ Status\":             csv.status,\n    \"📄 Dateien importiert\": status.gesamt_dateien,\n    \"💾 Chunks gesamt\":      status.gesamt_chunks,\n    \"📑 CSV gespeichert\":    csv.pfad,\n    \"🕐 Zeitstempel\":        new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        -64
+      ],
+      "id": "67c0dc7a-064f-46db-99b3-68f45ea064e6",
+      "name": "Last Status"
+    },
+    {
+      "parameters": {
+        "url": "http://ingestion-api:8001/export-report",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        736,
+        -192
+      ],
+      "id": "46d45efe-9f5c-42c3-9b0a-a65fd7a23d8d",
+      "name": "CSV Export",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ingestion-api:8001/save-to-chromadb",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chunks\": {{ JSON.stringify($json.chunks) }},\n  \"filename\": \"{{ $json.filename }}\",\n  \"hash\": \"{{ $('📋 Neue PDFs aufteilen').item.json.hash }}\"\n}\n\n\n",
+        "options": {
+          "timeout": 1800000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        880,
+        0
+      ],
+      "id": "01267d4d-d0dc-43c2-8880-031812043a97",
+      "name": "ChromaDB speichern",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -832,
+        448
+      ],
+      "id": "40cf3ded-4b16-4945-acc5-32398093614c",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -400,
+        -48
+      ],
+      "id": "44566993-95d6-4d69-82b7-20fba5ecf93c",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "url": "http://ingestion-api:8001/list-pdfs",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -1296,
+        224
+      ],
+      "id": "a1b47952-a0d6-4cf9-b1a7-43a5c61d2ddb",
+      "name": "List_pdfs"
+    },
+    {
+      "parameters": {
+        "amount": 2
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        928,
+        304
+      ],
+      "id": "20d99568-f0f0-4034-82a5-3086cd7b0ca7",
+      "name": "Wait1",
+      "webhookId": "d63b5749-5782-4c5e-b9f3-b8dc0e64acec"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "9b3a8310-8708-4b2c-8b63-ca55b6b7bf5a",
+              "leftValue": "={{ $json.needs_split }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -816,
+        -48
+      ],
+      "id": "2e3ec7c2-e8de-4363-83e8-eef46352aa5b",
+      "name": "PDF größer als 50 MB"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ingestion-api:8001/split-pdf",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  filename: $json.filename,\n  hash: $json.hash\n} }}",
+        "options": {
+          "timeout": 1800000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -944,
+        -192
+      ],
+      "id": "d331b779-77fe-4bd9-a1d9-b346c0215c74",
+      "name": "split-pdf"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Alle Antworten des Split-Endpunkts einlesen.\n// Ein Input entspricht jeweils einer großen Original-PDF.\nconst inputs = $input.all();\n\nconst outputItems = [];\n\ninputs.forEach((input, inputIndex) => {\n  const data = input.json;\n  const parts = Array.isArray(data.parts) ? data.parts : [];\n\n  parts.forEach((part, partIndex) => {\n    outputItems.push({\n      json: {\n        // Name und Größe der erzeugten Teil-PDF\n        filename: part.filename,\n        size_bytes: part.size_bytes,\n        size_mb: part.size_mb,\n\n        // Gemeinsame Dokumentinformationen\n        original_file: data.original,\n        hash: data.hash,\n        document_hash: data.hash,\n\n        // Unterscheidung der einzelnen Teile\n        part_number: partIndex + 1,\n        part_count: parts.length,\n\n        // Die Datei wurde bereits geteilt\n        needs_split: false,\n      },\n\n      // Sehr wichtig:\n      // Damit weiß n8n, aus welchem Split-Input dieses Item stammt.\n      pairedItem: {\n        item: inputIndex,\n      },\n    });\n  });\n});\n\nreturn outputItems;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -704,
+        -192
+      ],
+      "id": "bf3267a1-e37e-4ee7-9536-d4ffc7590326",
+      "name": "Teil-PDFs als Items"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "petra-ingest",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1552,
+        224
+      ],
+      "id": "a1ab59c2-27be-48c8-b6e8-1e1801f9e02c",
+      "name": "Webhook Trigger (petra-ingest)",
+      "webhookId": "10856055-5d24-4ce6-a51f-549ff454334f",
+      "notesInFlow": true,
+      "notes": "ERGAENZT: Ermoeglicht den Start dieses Workflows per HTTP-Aufruf aus dem Streamlit-Frontend (POST http://n8n:5678/webhook/petra-ingest), statt ihn ausschliesslich manuell in der n8n-UI zu starten. Antwortet sofort (onReceived) und laesst den Workflow im Hintergrund weiterlaufen, da einzelne Schritte bis zu 30 Minuten dauern koennen (siehe Timeout-Werte der HTTP-Request-Nodes). Fortschritt/Ergebnis wird vom Frontend ueber GET /status-summary abgefragt, nicht ueber die Webhook-Antwort."
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1552,
+        32
+      ],
+      "id": "94f6bd97-aef3-4d17-9fb4-d6576e1bdc3d",
+      "name": "When clicking ‘Execute workflow’"
+    }
+  ],
+  "connections": {
+    "🔍 Neue PDFs vorhanden?": {
+      "main": [
+        [
+          {
+            "node": "📋 Neue PDFs aufteilen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Keine neuen PDFs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📋 Neue PDFs aufteilen": {
+      "main": [
+        [
+          {
+            "node": "PDF größer als 50 MB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📄 PyMuPDF: Text + Tabellen": {
+      "main": [
+        [
+          {
+            "node": "🔎 Kein Text → OCR nötig?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔎 Kein Text → OCR nötig?": {
+      "main": [
+        [
+          {
+            "node": "🔡 Tesseract OCR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "✅ Text OK (kein OCR)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔡 Tesseract OCR": {
+      "main": [
+        [
+          {
+            "node": "🔗 Ergebnisse zusammenführen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔗 Ergebnisse zusammenführen": {
+      "main": [
+        [
+          {
+            "node": "✂️ LangChain Chunking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✂️ LangChain Chunking": {
+      "main": [
+        [
+          {
+            "node": "ChromaDB speichern",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 ChromaDB Status": {
+      "main": [
+        [
+          {
+            "node": "CSV Export",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✅ Text OK (kein OCR)": {
+      "main": [
+        [
+          {
+            "node": "✂️ LangChain Chunking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CSV Export": {
+      "main": [
+        [
+          {
+            "node": "Last Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ChromaDB speichern": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keine neuen PDFs": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "📊 ChromaDB Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📄 PyMuPDF: Text + Tabellen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Last Status": {
+      "main": [
+        []
+      ]
+    },
+    "List_pdfs": {
+      "main": [
+        [
+          {
+            "node": "🔍 Neue PDFs vorhanden?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PDF größer als 50 MB": {
+      "main": [
+        [
+          {
+            "node": "split-pdf",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "split-pdf": {
+      "main": [
+        [
+          {
+            "node": "Teil-PDFs als Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Teil-PDFs als Items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger (petra-ingest)": {
+      "main": [
+        [
+          {
+            "node": "List_pdfs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "List_pdfs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "versionId": "3c8a64d5-b62a-4fd2-a45d-9413af59e8ba",
+  "tags": []
+}
